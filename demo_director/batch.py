@@ -15,7 +15,7 @@ from dataclasses import replace
 
 from .director import direct
 from .gallery import write_gallery
-from .guard import names_to_block
+from .guard import derive_names, load_deny_terms
 from .propose import readme_near
 from .session import RecordingFailure
 from .shotlist import ShotListError, load
@@ -76,7 +76,8 @@ def _slug(title: str) -> str:
 
 
 def _render_one(path: str, outdir: str, scale: float, budget: int,
-                extra_names: tuple[str, ...] = (), allow_names: tuple[str, ...] = ()) -> dict:
+                extra_names: tuple[str, ...] = (), allow_names: tuple[str, ...] = (),
+                derive: bool = False) -> dict:
     item: dict = {"shotlist": path, "status": "ok", "error": None, "aspects": {}}
     try:
         sl = load(path)
@@ -84,13 +85,13 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
         item["status"] = "error"
         item["error"] = str(exc)
         return item
-    allow = tuple(allow_names)
-    watch = names_to_block(readme_near(pathlib.Path(path).parent) + "\n" + sl.title, allow)
-    sl = replace(sl, pii=PiiPolicy(
-        names=tuple(sl.pii.names) + tuple(extra_names),
-        allow=tuple(sl.pii.allow) + allow,
-        watch=tuple(sl.pii.watch) + watch,
-    ))
+    allow = {part.casefold() for part in allow_names}
+    deny = [term for term in tuple(sl.pii.names) + tuple(extra_names) + load_deny_terms()
+            if term.casefold() not in allow]
+    if derive:
+        derived = derive_names(readme_near(pathlib.Path(path).parent) + "\n" + sl.title, sl.title)
+        deny.extend(term for term in derived if term.casefold() not in allow and term not in deny)
+    sl = replace(sl, pii=PiiPolicy(names=tuple(deny), allow=tuple(allow_names)))
     item["title"] = sl.title
     try:
         rendered = direct(sl, outdir, scale, budget)
@@ -127,7 +128,7 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
 
 def batch(paths: list[str], outdir: str, scale: float = 0.6, budget: int = GIF_BUDGET,
           extra_names: tuple[str, ...] = (), screenshot: bool = False,
-          allow_names: tuple[str, ...] = ()) -> dict:
+          allow_names: tuple[str, ...] = (), derive_names: bool = False) -> dict:
     """Render every shot list. Report is deterministic for a given set of files.
 
     Frame counts come from the pure ``frames_for`` path. Byte sizes are measured
@@ -149,7 +150,7 @@ def batch(paths: list[str], outdir: str, scale: float = 0.6, budget: int = GIF_B
             dest = os.path.join(outdir, _slug(title))
         else:
             dest = outdir
-        items.append(_render_one(path, dest, scale, budget, names, allowed))
+        items.append(_render_one(path, dest, scale, budget, names, allowed, derive_names))
     report = {
         "ok": bool(items) and all(item.get("status") == "ok" for item in items),
         "budget_bytes": budget,

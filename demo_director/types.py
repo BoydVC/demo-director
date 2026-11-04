@@ -161,6 +161,10 @@ class BlankPolicy:
         r"failed to load",
         r"could(?: not|n't) load",
         r"unavailable",
+        r"unreachable",
+        r"nothing is (?:shown|guessed)",
+        r"no calendar data",
+        r"not valid json",
         r"\bno\b[\w\s,'-]{0,40}\bon air\b",
         r"\bno\b[\w\s,'-]{0,40}\byet\b",
         r"\berror\b",
@@ -180,17 +184,40 @@ class BlankPolicy:
             return re.sub(r"[^0-9A-Za-z]", "", value or "")
 
         meaningful = alnum(text)
-        outside = alnum(text)
-        if prominent:
-            # Drop one copy of the prominent block so "little else" is measurable.
-            outside = alnum(text.replace(prominent, "", 1))
-        for pattern in self.patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if not match:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()] or ([text.strip()] if text.strip() else [])
+
+        def matched(line: str):
+            for pattern in self.patterns:
+                found = re.search(pattern, line, re.IGNORECASE)
+                if found:
+                    return found
+            return None
+
+        error_lines = []
+        other_lines = []
+        snippet = ""
+        for line in lines:
+            found = matched(line)
+            # A line that leads with the phrase is the error. A sentence that
+            # only mentions it later still counts as page copy.
+            if found is None or found.start() > 24:
+                other_lines.append(line)
                 continue
-            snippet = " ".join(match.group(0).split()).casefold()
-            rest = len(meaningful) - len(alnum(match.group(0)))
-            in_prominent = bool(prominent) and re.search(pattern, prominent, re.IGNORECASE)
+            error_lines.append(line)
+            if not snippet:
+                snippet = " ".join(found.group(0).split()).casefold()
+        if error_lines:
+            if len(lines) == 1:
+                found = matched(lines[0])
+                rest = len(alnum(lines[0])) - len(alnum(found.group(0) if found else ""))
+            else:
+                # Single-word chrome (a tab, a zero, a clock) is not the demo.
+                kept = [line for line in other_lines if len(alnum(line)) >= 16]
+                rest = len(alnum(" ".join(kept)))
+            outside = alnum(text)
+            if prominent:
+                outside = alnum(text.replace(prominent, "", 1))
+            in_prominent = bool(prominent) and matched(prominent) is not None and matched(prominent).start() <= 24
             if rest < self.min_chars or (in_prominent and len(outside) < self.min_chars):
                 return f"error-phrase:{snippet}"
         if len(meaningful) < self.min_chars:

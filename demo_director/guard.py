@@ -9,8 +9,11 @@ safely is a hit, and the render does not proceed.
 """
 from __future__ import annotations
 
+import os
 import re
+import unicodedata
 from collections.abc import Iterable
+from pathlib import Path
 
 from .session import RecordingFailure
 
@@ -37,172 +40,151 @@ _PHONE = re.compile(
 )
 
 
-# Watch terms, not an automatic block. A README can mention a person; the
-# render blocks only when that term shows up in the page or a caption.
-_POSSESSIVE = re.compile(r"\b([A-Z][a-z]{2,})'s\b")
-_PAIR = re.compile(r"\b([A-Z][a-z]{2,}) ([A-Z][a-z]{2,})\b")
-_HANDLE = re.compile(r"(?<![\w])@([A-Za-z][A-Za-z0-9_]{2,})")
-# Common words and places. "Earth's", "What's", "Reader's", "Oriole Park" are not people.
-_NOT_PERSON = frozenset({
-    "today", "tonight", "tomorrow", "saturday", "sunday", "monday", "tuesday",
-    "wednesday", "thursday", "friday", "weekend", "week", "year", "month", "time",
-    "day", "night", "morning", "evening", "team", "demo", "user", "home", "game",
-    "board", "room", "click", "page", "error", "loading", "synthetic", "planner",
-    "check", "kit", "player", "locker", "keyboard", "kickoff", "practice", "session",
-    "match", "stats", "item", "field", "coach", "club", "sample", "example",
-    "test", "app", "data", "only", "what", "when", "where", "which", "who",
-    "whose", "whom", "how", "why", "this", "that", "these", "those", "there",
-    "here", "your", "their", "ours", "they", "them", "then", "than", "earth",
-    "world", "reader", "group", "island", "path", "life", "love", "best", "new",
-    "old", "first", "last", "next", "every", "each", "all", "some", "many",
-    "more", "most", "other", "such", "into", "from", "with", "have", "been",
-    "were", "will", "just", "like", "make", "made", "over", "after", "before",
-    "about", "again", "still", "also", "back", "down", "left", "right", "open",
-    "close", "start", "stop", "play", "goal", "ball", "score", "court", "season",
-    "round", "final", "super", "grand", "main", "side", "full", "half", "high",
-    "long", "short", "small", "large", "great", "little", "public", "local",
-    "total", "whole", "ready", "orange", "cones", "today", "archive", "times",
-    "roster", "badge", "drill", "timeline", "standing", "standings", "control",
-    "mission", "atlas", "bookmark", "galaxy", "constellation", "author", "card",
-    "cards", "note", "notes", "list", "lists", "map", "chart", "graph", "code",
-    "site", "blog", "post", "feed", "news", "story", "photo", "image", "video",
-    "audio", "music", "song", "show", "film", "movie", "sport", "sports",
-    "men", "women", "kids", "folks", "people",
-    "maryland", "basketball", "weekend", "director", "synthetic", "saturday",
-    "keyboard", "practice", "locker", "player", "session", "planner", "check",
-    "chelsea", "oriole", "orioles", "brooklyn", "london", "paris", "york",
-    "baltimore", "annapolis", "manhattan", "harlem", "mars", "venus", "jupiter",
-    "saturn", "moon", "star", "stars", "land", "sky", "sun", "park", "city",
-    "bay", "river", "hill", "lake", "mountain", "street", "road", "county",
-    "stadium", "arena", "garden", "harbor", "harbour", "beach", "valley",
-    "creek", "ridge", "heights", "square", "plaza", "bridge", "port", "coast",
-    "shore", "point", "falls", "springs", "woods", "forest", "desert", "ocean",
-    "sea", "gulf", "isle", "mount", "fort", "village", "town", "district",
-    "yard", "dome", "grounds", "pitch", "range", "course", "track", "pool",
-    "rink", "gym", "school", "college", "university", "library", "museum",
-    "market", "center", "centre", "station", "airport", "tower", "building",
-    "house", "hall", "palace", "castle", "gate", "wall", "avenue", "lane",
-    "drive", "place", "trail", "north", "south", "east", "west", "central",
-    "upper", "lower", "inner", "outer", "royal", "national", "state", "united",
-    "american", "group", "path", "reader", "earth", "island", "what",
-})
-_GENERIC_HANDLES = frozenset({
-    "demo", "example", "test", "synthetic", "user", "admin", "guest", "team", "bot", "sample",
-})
+# Optional derivation (--derive-names, off by default). Not a capitalization scan.
+_FOR_PERSON = re.compile(r"\bfor ([A-Z][a-z]{3,}) ([A-Z][a-z]{3,})\b")
+_POSS_NOUN = re.compile(r"\b([A-Z][a-z]{3,})'s ([A-Za-z][A-Za-z]+)\b")
+def normalize_text(text: str) -> str:
+    """NFKC, straight apostrophes, case-fold, possessive ``'s`` removed.
+
+    Letter-spaced runs such as ``B O Y D`` are collapsed so a deny term can
+    see the word the letters spell. Ordinary words keep their boundaries, so
+    a shorter term does not match inside a longer word.
+    """
+    if not isinstance(text, str):
+        return ""
+    folded = unicodedata.normalize("NFKC", text)
+    folded = folded.replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
+    folded = folded.casefold()
+    folded = re.sub(r"(?<=\w)'s\b", "", folded)
+    folded = re.sub(r"\s+", " ", folded)
+    return folded.strip()
 
 
-def _person_token(word: str) -> bool:
-    token = word.casefold()
-    return len(token) >= 3 and token not in _NOT_PERSON
+def _collapse_letter_runs(text: str) -> str:
+    def join(match: re.Match[str]) -> str:
+        return match.group(0).replace(" ", "")
+
+    return re.sub(r"(?<![a-z0-9])(?:[a-z]\s+){2,}[a-z](?![a-z0-9])", join, text)
 
 
-def _place_word(word: str) -> bool:
-    return word.casefold() in _NOT_PERSON and word.casefold() in {
-        "park", "island", "city", "bay", "river", "hill", "lake", "mountain",
-        "street", "road", "county", "stadium", "arena", "garden", "harbor",
-        "harbour", "beach", "valley", "creek", "ridge", "heights", "square",
-        "plaza", "bridge", "port", "coast", "shore", "point", "falls", "springs",
-        "woods", "forest", "desert", "ocean", "sea", "gulf", "isle", "mount",
-        "fort", "village", "town", "district", "yard", "dome", "grounds", "pitch",
-        "court", "field", "range", "course", "track", "center", "centre",
-        "station", "tower", "hall", "house", "place", "chelsea", "york",
-        "brooklyn", "london", "paris", "baltimore", "annapolis", "maryland",
-        "oriole", "orioles",
-    }
+def term_present(text: str, term: str) -> bool:
+    """True when ``term`` is its own word in ``text``, or spelled letter by letter."""
+    if not isinstance(text, str) or not isinstance(term, str):
+        return False
+    needle = normalize_text(term)
+    hay = normalize_text(text)
+    if not needle or not hay:
+        return False
+    if re.search(rf"(?<![\w]){re.escape(needle)}(?![\w])", hay):
+        return True
+    if needle.startswith("@"):
+        return False
+    # A letter-spaced run spells a word. "b o y d fridge" collapses to a string
+    # that still contains the denied word even when other letters follow.
+    for match in re.finditer(r"(?<![a-z0-9])(?:[a-z]\s+){2,}[a-z](?![a-z0-9])", hay):
+        if needle in match.group(0).replace(" ", ""):
+            return True
+    return False
 
 
-def watch_terms(text: str) -> tuple[str, ...]:
-    """Person-like terms and @handles in a README or title. Not a block by itself.
+def load_deny_terms() -> tuple[str, ...]:
+    """Terms from ``DEMO_DIRECTOR_DENY`` and ``.demo-director/deny.txt``.
 
-    Places and ordinary words are ignored. A ``First Last`` match also watches
-    the surname. ``--deny-name`` does not go through this filter.
+    One term per line. Blank lines and ``#`` comments are skipped. ``@handles``
+    are kept as written. This file is operator config and is not part of the repo.
+    """
+    paths: list[Path] = []
+    env = os.environ.get("DEMO_DIRECTOR_DENY")
+    if env:
+        paths.append(Path(env))
+    local = Path.cwd() / ".demo-director" / "deny.txt"
+    if local.is_file():
+        paths.append(local)
+    found: list[str] = []
+    for path in paths:
+        try:
+            raw = path.read_text()
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            term = line.split("#", 1)[0].strip()
+            if term and term not in found:
+                found.append(term)
+    return tuple(found)
+
+
+def _title_words(title: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", normalize_text(title)))
+
+
+def derive_names(text: str, title: str = "") -> tuple[str, ...]:
+    """Optional names from ``for First Last`` and ``Name's Noun`` only.
+
+    Words that belong to ``title`` are not returned, so a repo cannot block
+    on its own title. This is not used unless ``--derive-names`` is set.
+    There is no two-word capitalization scan and no ``@type`` pickup.
     """
     if not isinstance(text, str) or not text:
         return ()
+    skip = _title_words(title)
     found: list[str] = []
 
     def add(name: str) -> None:
         cleaned = " ".join(name.split())
-        if not cleaned or cleaned in found:
+        if not cleaned or cleaned.casefold() in skip or cleaned in found:
             return
         found.append(cleaned)
 
-    for match in _HANDLE.finditer(text):
-        handle = match.group(1)
-        if handle.casefold() in _GENERIC_HANDLES:
-            continue
-        add("@" + handle)
-    for match in _POSSESSIVE.finditer(text):
-        word = match.group(1)
-        if _person_token(word):
-            add(word)
-    for match in _PAIR.finditer(text):
+    for match in _FOR_PERSON.finditer(text):
         first, last = match.group(1), match.group(2)
-        if not _person_token(first) or not _person_token(last):
-            continue
-        if _place_word(last) or _place_word(first):
+        if first.casefold() in skip or last.casefold() in skip:
             continue
         add(f"{first} {last}")
         add(first)
         add(last)
+    for match in _POSS_NOUN.finditer(text):
+        add(match.group(1))
     return tuple(found)
 
 
-def derived_names(text: str) -> tuple[str, ...]:
-    """Watch terms a README or title gives away. Seeing one is not yet a block."""
-    return watch_terms(text)
+def derived_names(text: str, title: str = "") -> tuple[str, ...]:
+    return derive_names(text, title)
 
 
-def names_to_block(text: str, allow: Iterable[str] = ()) -> tuple[str, ...]:
-    """Watch terms left after the allowlist. The caller still has to see them rendered."""
-    allowed = {part.casefold() for part in allow if isinstance(part, str)}
-    return tuple(name for name in watch_terms(text) if name.casefold() not in allowed)
-
-
-def _contains_term(term: str, text: str) -> bool:
-    if not term or not text:
-        return False
-    if term.startswith("@"):
-        return term.casefold() in text.casefold()
-    return re.search(rf"(?<![\w]){re.escape(term)}(?![\w])", text, re.IGNORECASE) is not None
-
-
-def matched_terms(terms: Iterable[str], *, page: str = "", title: str = "",
+def locate_denied(terms: Iterable[str], *, page: str = "", title: str = "",
                   captions: Iterable[str] = ()) -> tuple[str, ...]:
-    """``term:where`` for watch or deny terms that actually appear.
+    """One ``term:place`` entry per denied term that is actually rendered.
 
-    ``where`` is page, caption, or title. A term that is only in a README is
-    not listed. Explicit deny names use the same locator and stay strict:
-    they are not dropped for being common words.
+    ``title`` covers the title card and the end card, which both draw that
+    string. Each term is reported once, with its places joined.
     """
-    caption_text = "\n".join(part for part in captions if part)
+    caption_list = [part for part in captions if part]
     found: list[str] = []
+    seen: set[str] = set()
     for term in terms:
         if not isinstance(term, str) or not term.strip():
             continue
         token = " ".join(term.split())
-        if _contains_term(token, page):
-            found.append(f"{token}:page")
-        elif _contains_term(token, caption_text):
-            found.append(f"{token}:caption")
-        elif _contains_term(token, title):
-            found.append(f"{token}:title")
-    return tuple(found)
-
-
-def page_handles(text: str) -> tuple[str, ...]:
-    """Non-generic @handles written on a page or caption. They are already seen."""
-    if not isinstance(text, str) or not text:
-        return ()
-    found: list[str] = []
-    for match in _HANDLE.finditer(text):
-        handle = match.group(1)
-        if handle.casefold() in _GENERIC_HANDLES:
+        key = normalize_text(token)
+        if not key or key in seen:
             continue
-        token = "@" + handle
-        if token not in found:
-            found.append(token)
+        places: list[str] = []
+        if title and term_present(title, token):
+            places.append("title")
+        if any(term_present(part, token) for part in caption_list):
+            places.append("caption")
+        if page and term_present(page, token):
+            places.append("page")
+        if not places:
+            continue
+        seen.add(key)
+        found.append(f"{token}:{'+'.join(places)}")
     return tuple(found)
+
+
+def name_detail(parts: Iterable[str]) -> str:
+    """Stable ``name:term:place`` detail with each term once."""
+    return "name:" + ",".join(parts)
 
 
 def _reserved_email(address: str) -> bool:
@@ -220,17 +202,16 @@ def hits(text: object, names: Iterable[str] = ()) -> tuple[str, ...]:
             found.append("email")
         if _PHONE.search(text):
             found.append("phone")
-        folded = text.casefold()
         for name in names:
             if not isinstance(name, str):
                 return ("unreadable",)
             token = name.strip()
             if not token:
                 continue
-            if len(token) < 3:
+            if len(token) < 3 and not token.startswith("@"):
                 found.append("name-policy")
                 continue
-            if token.casefold() in folded:
+            if term_present(text, token):
                 found.append("name")
     except Exception:
         return ("unreadable",)

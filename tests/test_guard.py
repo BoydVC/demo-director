@@ -1,4 +1,5 @@
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -323,6 +324,17 @@ class GuardTests(unittest.TestCase):
         from demo_director.types import BlankPolicy
         page = "Synthetic schedule for a Saturday session with orange cones ready today."
         self.assertIsNone(BlankPolicy().reason(page))
+        shell = "\n".join((
+            "7 DAYS",
+            "Calendar unavailable",
+            "The week server is unreachable (HTTP 404).",
+            "Nothing is shown rather than guessed.",
+            "Tonight",
+            "No calendar data, so no conflicts can be checked.",
+        ))
+        self.assertEqual(BlankPolicy().reason(shell), "error-phrase:unavailable")
+        desk = "The Sports Desk\nCouldn't load the desk: SyntaxError: Unexpected token is not valid JSON"
+        self.assertIn("error-phrase", BlankPolicy().reason(desk) or "")
         self.assertEqual(BlankPolicy(min_chars=500).reason(page), "sparse-text")
         self.assertEqual(BlankPolicy(patterns=(r"orange cones",)).reason("orange cones"), "error-phrase:orange cones")
         self.assertIsNone(BlankPolicy(patterns=(r"orange cones",)).reason(page))
@@ -377,37 +389,70 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(ctx.exception.kind, "blank-page", rel)
             self.assertEqual(ctx.exception.detail, detail, rel)
 
-    def test_derived_names_block_unless_allowlisted(self):
-        from demo_director.guard import derived_names, matched_terms, names_to_block
-        self.assertEqual(derived_names("Maryland Men's Basketball"), ())
-        self.assertEqual(derived_names("Earth's sky tonight"), ())
-        self.assertEqual(derived_names("What's next for the Reader's group"), ())
-        self.assertEqual(derived_names("Meet at Oriole Park on Saturday"), ())
-        self.assertEqual(derived_names("for a Saturday session"), ())
-        self.assertEqual(derived_names("Alex's Chair"), ("Alex",))
-        self.assertEqual(derived_names("Built for Alex Quinn (@samplebot)."), ("@samplebot", "Alex Quinn", "Alex", "Quinn"))
-        self.assertEqual(names_to_block("Alex's Chair", ("Alex",)), ())
-        # A README-only name is a watch term. It does not block a clean page.
+    def test_small_or_painted_canvas_still_renders(self):
         folder = pathlib.Path(tempfile.mkdtemp())
-        (folder / "README.md").write_text("# Desk\n\nSynthetic board for Alex Quinn (@samplebot).\n")
-        clean = example()
-        clean["title"] = "Weekend Planner demo"
-        clean["steps"] = [{"action": "hold", "frames": 2}]
-        clean["aspects"] = ["16:9"]
-        clean_path = folder / "clean.json"
-        clean_path.write_text(json.dumps(clean))
-        clean_out = tempfile.mkdtemp()
-        clean_report = batch([str(clean_path)], clean_out, scale=0.25)
-        self.assertEqual(clean_report["items"][0]["status"], "ok", clean_report)
-        # The surname and the @handle block only when the page renders them.
+        small = folder / "small.html"
+        small.write_text(
+            "<style>body{margin:0;background:#102;color:#eee;font-family:system-ui}"
+            ".grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:16px}"
+            ".card{min-height:180px;color:#fff;padding:16px}</style>"
+            "<h1>Desk</h1><p>Orange cones, green pinnies, and a blue whistle ready for Saturday.</p>"
+            "<canvas width=160 height=80 style=\"width:160px;height:80px;background:#334\"></canvas>"
+            "<div class=grid><div class=card style=\"background:#7c2d12\">Cones</div>"
+            "<div class=card style=\"background:#14532d\">Pinnies</div>"
+            "<div class=card style=\"background:#1e3a8a\">Whistle</div></div>"
+        )
+        painted = folder / "painted.html"
+        painted.write_text(
+            "<style>body{margin:0;background:#111;color:#eee;font-family:system-ui}"
+            "canvas{display:block;width:100%;height:640px;background:#111}</style>"
+            "<h1>Desk</h1><p>Orange cones, green pinnies, and a blue whistle ready for Saturday practice.</p>"
+            "<button id=paint>Paint</button>"
+            "<canvas id=sky width=960 height=640></canvas>"
+            "<script>document.getElementById('paint').onclick=()=>{"
+            "const c=document.getElementById('sky');const g=c.getContext('2d');"
+            "g.fillStyle='#7c2d12';g.fillRect(0,0,480,640);"
+            "g.fillStyle='#14532d';g.fillRect(480,0,480,640);}</script>"
+        )
+        for path, steps in (
+            (small, [{"action": "hold", "frames": 2}]),
+            (painted, [{"action": "click", "selector": "#paint", "frames": 2}, {"action": "hold", "frames": 2}]),
+        ):
+            data = example()
+            data["url"] = path.resolve().as_uri()
+            data["title"] = "Desk"
+            data["steps"] = steps
+            data["aspects"] = ["16:9"]
+            rendered = direct(parse(data), tempfile.mkdtemp(), scale=0.3)
+            self.assertIn("16:9", rendered, path.name)
+
+    def test_deny_list_matches_normalized_text_once(self):
+        from demo_director.guard import derive_names, load_deny_terms, locate_denied, term_present
+        self.assertFalse(term_present("alexander took a victory lap", "Alex"))
+        self.assertTrue(term_present("hello Alex today", "Alex"))
+        self.assertTrue(term_present("Alex\u2019s chair", "Alex"))
+        self.assertTrue(term_present("Q U I N N fridge board", "Quinn"))
+        self.assertFalse(term_present('{"@type":"Thing"}', "@samplebot"))
+        self.assertEqual(derive_names("Bot Launcher", title="Bot Launcher"), ())
+        self.assertEqual(derive_names("Built for Alex Quinn.", title="Desk"), ("Alex Quinn", "Alex", "Quinn"))
+        self.assertEqual(derive_names("Alex's Locker is open", title="Alex Locker"), ())
+        self.assertNotIn("@type", derive_names('{"@type":"Thing"} for the Bot Launcher', title="Bot Launcher"))
+        found = locate_denied(("Quinn", "quinn", "@samplebot"), page="Quinn (@samplebot) kept a note", title="Desk")
+        self.assertEqual(found, ("Quinn:page", "@samplebot:page"))
+        self.assertEqual(found.count("Quinn:page"), 1)
+        folder = pathlib.Path(tempfile.mkdtemp())
+        deny = folder / "deny.txt"
+        deny.write_text("# synthetic\nQuinn\n@samplebot\n")
         leaked = folder / "leaked.html"
         leaked.write_text(
             "<style>body{margin:0;background:#102;color:#eee;font-family:system-ui}"
-            ".a{background:#7c2d12;color:#fff;padding:20px}.b{background:#14532d;color:#fff;padding:20px}"
-            ".c{background:#1e3a8a;color:#fff;padding:20px}</style>"
-            "<h1>Desk</h1><p>Everything Quinn (@samplebot) bookmarked for a Saturday session "
-            "with orange cones ready today.</p>"
-            "<div class=a>Cones</div><div class=b>Pinnies</div><div class=c>Whistle</div>"
+            "header{background:#1e293b;padding:16px}.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:16px}"
+            ".card{min-height:160px;color:#fff;padding:16px}</style>"
+            "<header><h1>Desk</h1></header>"
+            "<p>Everything Quinn (@samplebot) bookmarked for a Saturday session with orange cones ready today.</p>"
+            "<div class=grid><div class=card style=\"background:#7c2d12\">Cones</div>"
+            "<div class=card style=\"background:#14532d\">Pinnies</div>"
+            "<div class=card style=\"background:#1e3a8a\">Whistle</div></div>"
         )
         seen = example()
         seen["title"] = "Desk"
@@ -416,24 +461,29 @@ class GuardTests(unittest.TestCase):
         seen["aspects"] = ["16:9"]
         seen_path = folder / "seen.json"
         seen_path.write_text(json.dumps(seen))
-        blocked = batch([str(seen_path)], tempfile.mkdtemp(), scale=0.25)
+        old = os.environ.get("DEMO_DIRECTOR_DENY")
+        os.environ["DEMO_DIRECTOR_DENY"] = str(deny)
+        try:
+            self.assertEqual(load_deny_terms(), ("Quinn", "@samplebot"))
+            blocked = batch([str(seen_path)], tempfile.mkdtemp(), scale=0.25)
+        finally:
+            if old is None:
+                os.environ.pop("DEMO_DIRECTOR_DENY", None)
+            else:
+                os.environ["DEMO_DIRECTOR_DENY"] = old
         item = blocked["items"][0]
         self.assertEqual(item["status"], "pii-blocked")
-        self.assertIn("Quinn:page", item["error"])
+        self.assertEqual(item["error"].count("Quinn:page"), 1)
         self.assertIn("@samplebot:page", item["error"])
-        self.assertIn("Quinn:page", item["detail"] if "detail" in item else item["error"])
-        self.assertNotIn("Miranda", item["error"])
-        # Explicit deny stays strict for a common word the watch list ignores.
-        denied = example()
-        denied["steps"] = [{"action": "caption", "text": "Earth's sky tonight", "frames": 2}]
-        denied["aspects"] = ["16:9"]
-        denied_path = folder / "earth.json"
-        denied_path.write_text(json.dumps(denied))
-        earth = batch([str(denied_path)], tempfile.mkdtemp(), scale=0.25, extra_names=("Earth",))
-        self.assertEqual(earth["items"][0]["status"], "pii-blocked")
-        self.assertIn("Earth", earth["items"][0]["error"])
-        self.assertIn("caption", earth["items"][0]["error"])
-        self.assertEqual(matched_terms(("Earth",), captions=("Earth's sky tonight",)), ("Earth:caption",))
+        # A multi-word title is not a deny term unless it is listed.
+        plain = example()
+        plain["title"] = "Bot Launcher"
+        plain["steps"] = [{"action": "caption", "text": "Bot Launcher", "frames": 2}, {"action": "hold", "frames": 2}]
+        plain["aspects"] = ["16:9"]
+        plain_path = folder / "plain.json"
+        plain_path.write_text(json.dumps(plain))
+        opened = batch([str(plain_path)], tempfile.mkdtemp(), scale=0.25)
+        self.assertEqual(opened["items"][0]["status"], "ok", opened)
 
 
 if __name__ == "__main__":

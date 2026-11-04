@@ -54,9 +54,13 @@ def _init(argv: list[str]) -> int:
     ap.add_argument("target")
     ap.add_argument("-o", "--out")
     ap.add_argument("--allow-name", action="append", default=[])
+    ap.add_argument("--deny-name", action="append", default=[])
+    ap.add_argument("--derive-names", action="store_true")
     a = ap.parse_args(argv)
     try:
-        data = dump_draft(init_source(a.target, tuple(a.allow_name)))
+        data = dump_draft(init_source(
+            a.target, tuple(a.allow_name), tuple(a.deny_name), a.derive_names,
+        ))
     except RecordingFailure as exc:
         print(json.dumps(_failure_payload(exc)))
         return 1
@@ -78,11 +82,13 @@ def _batch(argv: list[str]) -> int:
     ap.add_argument("--budget", type=int, default=GIF_BUDGET)
     ap.add_argument("--deny-name", action="append", default=[])
     ap.add_argument("--allow-name", action="append", default=[])
+    ap.add_argument("--derive-names", action="store_true")
     ap.add_argument("--screenshot", action="store_true")
     a = ap.parse_args(argv)
     report = batch(
         a.paths, a.out, a.scale, a.budget, tuple(a.deny_name),
         screenshot=a.screenshot, allow_names=tuple(a.allow_name),
+        derive_names=a.derive_names,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 1 if failed(report) else 0

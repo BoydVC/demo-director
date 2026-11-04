@@ -19,7 +19,7 @@ from pathlib import Path
 from PIL import Image
 
 from . import compose
-from .guard import hits, matched_terms, page_handles
+from .guard import hits, load_deny_terms, locate_denied, name_detail
 from .session import Phase, RecordingFailure, Session, StepSignals, run_step
 from .shotlist import ASPECTS, FIXTURE_URL
 from .types import Beat, BlankPolicy, Box, ShotList, step_selector, step_text
@@ -184,13 +184,7 @@ _LINES_JS = """
 _TEXT_JS = """
 () => {
   if (!document.body) return "";
-  const parts = [];
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let node;
-  while ((node = walker.nextNode())) {
-    const text = (node.textContent || "").trim();
-    if (text) parts.push(text);
-  }
+  const parts = [document.body.innerText || ""];
   document.querySelectorAll("input, textarea").forEach((el) => {
     if (el.value) parts.push(el.value);
     if (el.placeholder) parts.push(el.placeholder);
@@ -298,7 +292,9 @@ def classify_failure(exc: BaseException, *, navigating: bool = False) -> str:
 
 _PAGE_STATE_JS = """
 () => {
-  const text = document.body ? (document.body.innerText || "").replace(/\\s+/g, " ").trim() : "";
+  const text = document.body ? (document.body.innerText || "") : "";
+  const mainEl = document.querySelector("main, [role=main]");
+  const main = mainEl ? (mainEl.innerText || "") : "";
   let styled = false;
   for (const sheet of document.styleSheets) {
     try {
@@ -310,37 +306,7 @@ _PAGE_STATE_JS = """
   }
   const prominent = [...document.querySelectorAll("h1,h2,[role=alert],[role=status]")]
     .map((el) => (el.innerText || "").trim()).filter(Boolean).join("\\n");
-  function canvasBlank(canvas) {
-    const rect = canvas.getBoundingClientRect();
-    if (rect.width < 280 || rect.height < 180) return false;
-    const w = canvas.width || 0;
-    const h = canvas.height || 0;
-    if (w < 2 || h < 2) return false;
-    let ctx = null;
-    try { ctx = canvas.getContext("2d"); } catch (e) { ctx = null; }
-    if (!ctx) return false;
-    let data;
-    try {
-      data = ctx.getImageData(0, 0, Math.min(w, 48), Math.min(h, 48)).data;
-    } catch (e) {
-      return false;
-    }
-    let min = 255;
-    let max = 0;
-    let painted = 0;
-    for (let i = 0; i < data.length; i += 16) {
-      const alpha = data[i + 3];
-      const lum = data[i] + data[i + 1] + data[i + 2];
-      if (alpha < 8) continue;
-      painted += 1;
-      if (lum < min) min = lum;
-      if (lum > max) max = lum;
-    }
-    if (painted < 4) return true;
-    return max - min < 18;
-  }
-  const emptyCanvas = [...document.querySelectorAll("canvas")].some(canvasBlank);
-  return {text, styled, prominent, emptyCanvas};
+  return {text, main, styled, prominent};
 }
 """
 
@@ -365,14 +331,24 @@ def page_problem(page, response, policy: BlankPolicy | None = None) -> str | Non
     if not isinstance(raw, dict):
         return "no-visible-text"
     text = raw.get("text") if isinstance(raw.get("text"), str) else ""
+    main = raw.get("main") if isinstance(raw.get("main"), str) else ""
     if not raw.get("styled"):
         return "unstyled"
-    if raw.get("emptyCanvas"):
-        return "empty-canvas"
     if not text.strip():
         return "no-visible-text"
     prominent = raw.get("prominent") if isinstance(raw.get("prominent"), str) else ""
-    return rules.reason(text, prominent)
+    # The main region can be an error shell while the header and footer
+    # still add enough characters to look like a page.
+    problem = rules.reason(text, prominent)
+    if problem:
+        return problem
+    # Header and footer can pad the body while main itself is the error.
+    # A short main that is not an error phrase is just a canvas game.
+    if main.strip() and main.strip() != text.strip():
+        main_problem = rules.reason(main, "")
+        if main_problem and main_problem.startswith("error-phrase"):
+            return main_problem
+    return None
 
 
 def refuse_unusable(page, response, step_index: int = -1, policy: BlankPolicy | None = None) -> None:
@@ -513,9 +489,55 @@ def _drive_step(page, session: Session, step, names: tuple[str, ...],
     return final, Beat(before, after, box, step, label, lines)
 
 
-def _name_failure(parts: tuple[str, ...] | list[str]) -> RecordingFailure:
-    detail = "name:" + ",".join(parts)
-    return RecordingFailure("pii-blocked", -1, detail, warning=detail)
+def _name_failure(parts: tuple[str, ...] | list[str], step_index: int = -1) -> RecordingFailure:
+    detail = name_detail(parts)
+    return RecordingFailure("pii-blocked", step_index, detail, warning=detail)
+
+
+_CANVAS_BOX_JS = """
+() => {
+  const vw = window.innerWidth || 1;
+  const vh = window.innerHeight || 1;
+  const view = vw * vh;
+  const boxes = [];
+  for (const canvas of document.querySelectorAll("canvas")) {
+    const style = getComputedStyle(canvas);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) continue;
+    const rect = canvas.getBoundingClientRect();
+    const x0 = Math.max(0, rect.x);
+    const y0 = Math.max(0, rect.y);
+    const x1 = Math.min(vw, rect.right);
+    const y1 = Math.min(vh, rect.bottom);
+    const visible = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+    if (visible / view <= 0.5) continue;
+    boxes.push({x: x0, y: y0, w: x1 - x0, h: y1 - y0});
+  }
+  return boxes;
+}
+"""
+
+
+def _region_flat(image: Image.Image, box: dict) -> bool:
+    x = max(0, int(box.get("x", 0)))
+    y = max(0, int(box.get("y", 0)))
+    w = max(1, int(box.get("w", 1)))
+    h = max(1, int(box.get("h", 1)))
+    crop = image.crop((x, y, min(image.width, x + w), min(image.height, y + h)))
+    if crop.width < 2 or crop.height < 2:
+        return False
+    return _flat_ratio(crop) >= 0.9
+
+
+def _dominant_canvas_blank(page) -> bool | None:
+    """True when a canvas covering most of the viewport is a flat empty field."""
+    try:
+        boxes = page.evaluate(_CANVAS_BOX_JS)
+    except Exception:
+        return None
+    if not isinstance(boxes, list) or not boxes:
+        return None
+    shot = _snap(page)
+    return all(_region_flat(shot, box) for box in boxes if isinstance(box, dict))
 
 
 def _caption_texts(sl: ShotList) -> list[str]:
@@ -527,21 +549,15 @@ def record(sl: ShotList) -> list[Beat]:
     from playwright.sync_api import sync_playwright
 
     sl = resolve_fixture(sl)
-    names = sl.pii.names
-    allow = {part.casefold() for part in sl.pii.allow}
-    watch = tuple(term for term in sl.pii.watch if term.casefold() not in allow)
+    names = tuple(dict.fromkeys(tuple(sl.pii.names) + load_deny_terms()))
     captions = _caption_texts(sl)
     session = Session.idle()
     blob = hits(shotlist_blob(sl), ())
     if blob:
         blocked = run_step(session, StepSignals(False, True, None, True, False))
         raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(blob))
-    # Strict deny names are not filtered as common words. Watch terms from a
-    # README block only when the rendered title, a caption, or the page shows them.
-    strict_before = matched_terms(names, title=sl.title, captions=captions)
-    watch_before = matched_terms(watch, title=sl.title, captions=captions)
-    handle_before = tuple(f"{handle}:caption" for handle in page_handles("\n".join(captions) + "\n" + sl.title))
-    named = strict_before + watch_before + handle_before
+    # Title and end cards both draw sl.title. Captions are their own steps.
+    named = locate_denied(names, title=sl.title, captions=captions)
     if named:
         raise _name_failure(named)
 
@@ -560,12 +576,13 @@ def record(sl: ShotList) -> list[Beat]:
             if opening_hits:
                 blocked = run_step(session, StepSignals(False, True, None, True, False))
                 raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(opening_hits))
-            seen = matched_terms(tuple(names) + watch, page=opening or "")
-            seen += tuple(f"{handle}:page" for handle in page_handles(opening or ""))
+            seen = locate_denied(names, page=opening or "")
             if seen:
                 raise _name_failure(seen)
             policy = sl.blank or BlankPolicy()
             refuse_unusable(page, response, policy=policy)
+            page.wait_for_timeout(250)
+            canvas_flags = [_dominant_canvas_blank(page)]
             for index, step in enumerate(sl.steps):
                 try:
                     session, beat = _drive_step(page, session, step, names, policy)
@@ -575,7 +592,14 @@ def record(sl: ShotList) -> list[Beat]:
                 if beat is None:
                     selector = step_selector(step) or getattr(step, "url", "") or ""
                     detail = session.failure or "no beat"
-                    if session.failure == "nav-error":
+                    if session.failure == "pii-blocked":
+                        later = _page_text(page) or ""
+                        named = locate_denied(names, page=later)
+                        if named:
+                            raise _name_failure(named, index)
+                        reasons = hits(later, ())
+                        detail = ",".join(reasons) or "pii"
+                    elif session.failure == "nav-error":
                         detail = "navigation"
                     elif session.failure == "invalid-value":
                         detail = "invalid-value"
@@ -585,6 +609,16 @@ def record(sl: ShotList) -> list[Beat]:
                 beats.append(beat)
                 if session.beats != len(beats):
                     raise RecordingFailure("timeout", index, "beat invariant")
+                later = _page_text(page)
+                step_hit = locate_denied(names, page=later or "")
+                if step_hit:
+                    raise _name_failure(step_hit, index)
+                canvas_flags.append(_dominant_canvas_blank(page))
+            if canvas_flags and all(flag is True for flag in canvas_flags):
+                raise RecordingFailure(
+                    "blank-page", -1, "empty-canvas",
+                    warning="page is not demoable: empty-canvas",
+                )
         finally:
             browser.close()
     return beats
@@ -804,7 +838,8 @@ def _empty_body(beats: list[Beat]) -> str | None:
     shots = [shot for shot in shots if shot is not None]
     if len(shots) < 2:
         return None
-    if not _flat_ratio(shots[0]) >= 0.82:
+    # Near-solid walls only. A dark poster with real copy sits under this.
+    if not _flat_ratio(shots[0]) >= 0.95:
         return None
     if any(_mean_delta(shots[0], shot) >= 8 for shot in shots[1:]):
         return None

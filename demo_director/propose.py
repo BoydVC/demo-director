@@ -13,8 +13,7 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlparse
 
-from .guard import hits, names_to_block
-from .types import PiiPolicy
+from .guard import derive_names, hits, load_deny_terms, locate_denied, name_detail
 from .session import RecordingFailure
 from .shotlist import FIXTURE_URL, dump
 from .types import (
@@ -265,9 +264,31 @@ def readme_near(start: pathlib.Path) -> str:
     return ""
 
 
-def _watch_from(chunks: list[str], allow: tuple[str, ...] = ()) -> tuple[str, ...]:
-    """README and title terms. They block later, only if a render shows them."""
-    return names_to_block("\n".join(chunks), allow)
+def _deny_terms(extra: tuple[str, ...] = (), readme: str = "", title: str = "",
+               derive: bool = False) -> tuple[str, ...]:
+    """Explicit deny names, the deny file, and optional ``for First Last`` hits.
+
+    Derived words that are already in ``title`` are dropped so a repo title
+    cannot block itself. Derivation is off unless the caller asks.
+    """
+    terms: list[str] = []
+    for term in tuple(extra) + load_deny_terms():
+        if term and term not in terms:
+            terms.append(term)
+    if derive:
+        for term in derive_names(readme + "\n" + title, title):
+            if term not in terms:
+                terms.append(term)
+    return tuple(terms)
+
+
+def _refuse_denied(terms: tuple[str, ...], *, page: str = "", title: str = "",
+                   captions: tuple[str, ...] | list[str] = ()) -> None:
+    found = locate_denied(terms, page=page, title=title, captions=captions)
+    if not found:
+        return
+    detail = name_detail(found)
+    raise RecordingFailure("pii-blocked", -1, detail, warning=detail)
 
 
 def public_text(text: str, fallback: str) -> str:
@@ -365,8 +386,7 @@ def _refuse(text: object) -> None:
 
 
 def draft_from(title: str, url: str, headings: tuple[str, ...] | list[str],
-               page: PageControls | None, results: tuple[str, ...] = (),
-               watch: tuple[str, ...] = ()) -> Draft:
+               page: PageControls | None, results: tuple[str, ...] = ()) -> Draft:
     steps = []
     notes: list[SourceNote] = []
 
@@ -400,7 +420,6 @@ def draft_from(title: str, url: str, headings: tuple[str, ...] | list[str],
         url=url,
         steps=tuple(steps),
         aspects=(Aspect.WIDE, Aspect.SQUARE, Aspect.TALL),
-        pii=PiiPolicy(watch=tuple(watch)),
     )
     return Draft(shot, tuple(notes))
 
@@ -501,17 +520,22 @@ def probe(url: str) -> tuple[PageControls, tuple[str, ...], str]:
 
 
 def from_page(url: str, fallback: str = "Demo", slug: str = "",
-              allow_names: tuple[str, ...] = ()) -> Draft:
+              allow_names: tuple[str, ...] = (), deny_names: tuple[str, ...] = (),
+              derive: bool = False) -> Draft:
     page, results, text = probe(url)
     _refuse(text)
     local = pathlib.Path(urlparse(url).path) if url.startswith("file:") else None
     readme = readme_near(local) if local is not None else ""
     chosen = display_title(page.title or fallback, slug or fallback)
-    watch = _watch_from([readme, page.title, chosen], allow_names)
-    return draft_from(chosen, _portable(url), (), page, results, watch)
+    terms = _deny_terms(deny_names, readme, chosen, derive)
+    allowed = {part.casefold() for part in allow_names}
+    terms = tuple(term for term in terms if term.casefold() not in allowed)
+    _refuse_denied(terms, page=text, title=chosen, captions=(chosen,))
+    return draft_from(chosen, _portable(url), (), page, results)
 
 
-def from_readme(path: pathlib.Path, slug: str = "", allow_names: tuple[str, ...] = ()) -> Draft:
+def from_readme(path: pathlib.Path, slug: str = "", allow_names: tuple[str, ...] = (),
+                deny_names: tuple[str, ...] = (), derive: bool = False) -> Draft:
     text = path.read_text()
     _refuse(text)
     headings = headings_in(text)
@@ -523,24 +547,32 @@ def from_readme(path: pathlib.Path, slug: str = "", allow_names: tuple[str, ...]
         if not headings:
             raise ShotListError(f"no headings in {path}")
         title = display_title(headings[0], slug)
-        watch = _watch_from([text, title], allow_names)
-        return draft_from(title, FIXTURE_URL, (title, *headings[1:]), None, watch=watch)
+        terms = _deny_terms(deny_names, text, title, derive)
+        allowed = {part.casefold() for part in allow_names}
+        terms = tuple(term for term in terms if term.casefold() not in allowed)
+        _refuse_denied(terms, title=title, captions=(title, *headings[1:]))
+        return draft_from(title, FIXTURE_URL, (title, *headings[1:]), None)
     page, results, page_text = probe(url)
     _refuse(page_text)
     raw = headings[0] if headings else page.title
     title = display_title(raw, slug or path.parent.name)
-    watch = _watch_from([text, page.title, title], allow_names)
+    terms = _deny_terms(deny_names, text, title, derive)
+    allowed = {part.casefold() for part in allow_names}
+    terms = tuple(term for term in terms if term.casefold() not in allowed)
     shown = (title, *headings[1:]) if headings else ()
-    return draft_from(title, _portable(url), shown, page, results, watch)
+    _refuse_denied(terms, page=page_text, title=title, captions=shown or (title,))
+    return draft_from(title, _portable(url), shown, page, results)
 
 
-def init_source(source: str, allow_names: tuple[str, ...] = ()) -> Draft:
+def init_source(source: str, allow_names: tuple[str, ...] = (),
+                deny_names: tuple[str, ...] = (), derive: bool = False) -> Draft:
     allow = tuple(allow_names)
+    deny = tuple(deny_names)
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", source):
-        return from_page(source, "Demo", allow_names=allow)
+        return from_page(source, "Demo", allow_names=allow, deny_names=deny, derive=derive)
     path = pathlib.Path(source)
     if path.is_file() and (path.suffix.lower() in {".md", ".markdown"} or path.name.lower().startswith("readme")):
-        return from_readme(path, slug=repo_slug(path.parent), allow_names=allow)
+        return from_readme(path, slug=repo_slug(path.parent), allow_names=allow, deny_names=deny, derive=derive)
     if path.is_dir():
         readme = None
         for name in ("README.md", "Readme.md", "readme.md"):
@@ -550,12 +582,12 @@ def init_source(source: str, allow_names: tuple[str, ...] = ()) -> Draft:
                 break
         slug = repo_slug(path)
         if readme is not None:
-            return from_readme(readme, slug=slug, allow_names=allow)
+            return from_readme(readme, slug=slug, allow_names=allow, deny_names=deny, derive=derive)
         html = _find_html(path)
         if html is None:
             raise ShotListError(f"no HTML fixture under {path}")
-        return from_page(html.resolve().as_uri(), slug, slug=slug, allow_names=allow)
+        return from_page(html.resolve().as_uri(), slug, slug=slug, allow_names=allow, deny_names=deny, derive=derive)
     if path.is_file():
         slug = repo_slug(path)
-        return from_page(path.resolve().as_uri(), slug, slug=slug, allow_names=allow)
+        return from_page(path.resolve().as_uri(), slug, slug=slug, allow_names=allow, deny_names=deny, derive=derive)
     raise ShotListError(f"init source not found: {source}")

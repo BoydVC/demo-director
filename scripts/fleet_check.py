@@ -121,6 +121,52 @@ def _load_json(raw: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def diff_status(actual: list[dict], expected: dict) -> list[str]:
+    """Lines ``repo expected actual`` for every bucket that disagrees.
+
+    ``expected`` maps a repo name to a bucket string, or to an object with
+    ``bucket``. Repos only on one side are included so the totals can be audited.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for row in actual:
+        repo = str(row.get("repo") or "")
+        seen.add(repo)
+        want = expected.get(repo)
+        if isinstance(want, dict):
+            want = want.get("bucket") or want.get("status")
+        got = str(row.get("bucket") or "")
+        if want is None:
+            lines.append(f"{repo}\tmissing-from-expected\t{got}")
+        elif str(want) != got:
+            lines.append(f"{repo}\texpected {want}\tactual {got}")
+    for repo in expected:
+        if repo in seen:
+            continue
+        want = expected[repo]
+        if isinstance(want, dict):
+            want = want.get("bucket") or want.get("status")
+        lines.append(f"{repo}\texpected {want}\tmissing-from-run")
+    return lines
+
+
+def _report_expect(path: Path | None, repos: list[dict]) -> int:
+    if path is None:
+        return 0
+    expected = json.loads(path.read_text())
+    if not isinstance(expected, dict):
+        print("expected status must be a JSON object")
+        return 2
+    lines = diff_status(repos, expected)
+    if not lines:
+        print("expect: no per-repo differences")
+        return 0
+    print(f"expect: {len(lines)} per-repo differences")
+    for line in lines:
+        print(line)
+    return 1
+
+
 def _bucket(status: str, detail: str) -> str:
     if status == "ok":
         return "ok"
@@ -133,10 +179,10 @@ def _bucket(status: str, detail: str) -> str:
     return "other"
 
 
-def _run(cmd: list[str], env: dict, timeout: int) -> tuple[int, str, str]:
+def _run(cmd: list[str], env: dict, timeout: int, cwd: Path | None = None) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
-            cmd, env=env, cwd=ROOT, text=True,
+            cmd, env=env, cwd=str(cwd or ROOT), text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
@@ -202,8 +248,12 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
             row["bucket"] = "other"
             row["stderr"] = err[-400:]
             return row
+    # Same as a local `python3 build.py` in the repo: relative paths and dist/ output.
     if (root / "build.py").is_file():
-        _run([sys.executable, str(root / "build.py")], env, 90)
+        _run([sys.executable, "build.py"], env, 90, cwd=root)
+        row["built"] = True
+    else:
+        row["built"] = False
     rel = _entry(root)
     if rel is None:
         row["detail"] = "no html entry"
@@ -225,7 +275,7 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
         shot_path.parent.mkdir(parents=True, exist_ok=True)
         outdir.mkdir(parents=True, exist_ok=True)
         code, stdout, stderr = _run(
-            [sys.executable, "-m", "demo_director", "init", url, "-o", str(shot_path)],
+            [sys.executable, "-m", "demo_director", "init", url, "-o", str(shot_path), "--slug", repo],
             env, 120,
         )
         payload = _load_json(stdout)
@@ -291,6 +341,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--only", action="append", default=[])
+    ap.add_argument("--expect", type=Path, default=None,
+                    help="JSON object of repo to bucket; print a per-repo diff")
     args = ap.parse_args(argv)
     rows = _read_set(args.set)
     if args.only:
@@ -316,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             clean = {
                 "bucket": item.get("bucket") or _bucket(str(item.get("status") or ""), str(item.get("detail") or "")),
+                "built": bool(item.get("built")),
                 "detail": item.get("detail") or "",
                 "group": item.get("group") or group,
                 "repo": repo,
@@ -341,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
     if not pending:
         store()
         print(args.out.read_text())
-        return 0
+        return _report_expect(args.expect, json.loads(args.out.read_text()).get("repos") or [])
     workers = max(1, args.jobs)
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {
@@ -364,7 +417,8 @@ def main(argv: list[str] | None = None) -> int:
             store()
             print(f"{row['repo']}\t{row['bucket']}\t{row.get('title','')}\t{row.get('detail','')[:160]}", flush=True)
     print(args.out.read_text())
-    return 0
+    summary = json.loads(args.out.read_text())
+    return _report_expect(args.expect, summary.get("repos") or [])
 
 
 if __name__ == "__main__":

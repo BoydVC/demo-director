@@ -122,7 +122,11 @@ _DISCOVER_JS = r"""
   const buttons = [...document.querySelectorAll("button, [role=button], input[type=submit], input[type=button]")]
     .filter(visible).slice(0, 6)
     .map((el) => ({selector: selectorOf(el), text: textOf(el)}));
-  const title = ((document.querySelector("h1") && document.querySelector("h1").innerText) || document.title || "Demo").trim().slice(0, 80);
+  const h1 = document.querySelector("h1");
+  // textContent, not innerText: CSS text-transform must not change the title.
+  const heading = h1 ? (h1.textContent || "").replace(/\s+/g, " ").trim() : "";
+  const docTitle = (document.title || "").replace(/\s+/g, " ").trim();
+  const title = (heading || docTitle || "Demo").slice(0, 80);
   const results = [...document.querySelectorAll("#conf, #status, #result, #output, [data-result], .result")]
     .filter(visible).slice(0, 2).map(selectorOf);
   const text = document.body ? (document.body.innerText || "") : "";
@@ -155,28 +159,66 @@ def headings_in(text: str) -> tuple[str, ...]:
     return tuple(found[:6])
 
 
+# Short tokens that stay uppercase when a shouted title is normalized.
+_ACRONYMS = frozenset({"API", "HQ", "MLB"})
+
+
+def _case_word(token: str) -> str:
+    if token.upper() in _ACRONYMS:
+        return token.upper()
+    if not token:
+        return token
+    return token[:1].upper() + token[1:].lower()
+
+
 def human_title(slug: str) -> str:
     """Title-case a repo slug, splitting only on hyphens and underscores.
 
     ``four-game-jam`` becomes ``Four Game Jam``. A compound word with no
-    separator stays whole, so a slug token is never cut with a word list.
+    separator stays whole.
     """
     parts = [part for part in re.split(r"[-_]+", (slug or "").strip()) if part]
-    titled = " ".join(part[:1].upper() + part[1:].lower() for part in parts)
+    titled = " ".join(_case_word(part) for part in parts)
     return titled or "Demo"
 
 
-def display_title(page_title: str, slug: str = "") -> str:
-    """Use a page heading verbatim. The repo slug is only the fallback.
+def normalize_title(text: str) -> str:
+    """Title-case an all-caps heading or a hyphenated token.
 
-    An ``h1`` or document title such as ``Starship Tower`` is kept as written.
-    ``four-game-jam`` is spaced only when that slug is the title we have.
+    Mixed-case headings stay as written, so ``Starship Tower`` is unchanged.
+    ``CHOPSTICKS`` becomes ``Chopsticks`` and ``Four-Game Jam`` becomes
+    ``Four Game Jam``. ``API``, ``HQ``, and ``MLB`` stay uppercase.
+    """
+    raw = " ".join((text or "").split())
+    if not raw:
+        return ""
+    letters = re.sub(r"[^A-Za-z]", "", raw)
+    shouted = bool(letters) and letters.isupper()
+    if not shouted and not re.search(r"[-_]", raw):
+        return raw
+    parts = [part for part in re.split(r"[-_\s]+", raw) if part]
+    return " ".join(_case_word(part) for part in parts)
+
+
+def _letters(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").casefold())
+
+
+def display_title(page_title: str, slug: str = "") -> str:
+    """Normalize a page heading, then the document title, then the slug.
+
+    The caller passes the h1 text, or the document title when the h1 is empty.
+    A shouted logo that drops separators yields to the slug when the slug
+    spells the same letters with more words (``FOUR-GAMEJAM`` / ``four-game-jam``).
     """
     raw = " ".join((page_title or "").split())
     pretty = human_title(slug) if slug else ""
     if not raw or raw.casefold() in {"demo", "index.html", "index.htm"}:
         return pretty or "Demo"
-    return raw
+    titled = normalize_title(raw)
+    if pretty and _letters(raw) == _letters(slug) and len(pretty.split()) > len(titled.split()):
+        return pretty
+    return titled or pretty or raw
 
 
 def repo_slug(path: pathlib.Path) -> str:
@@ -514,14 +556,16 @@ def from_readme(path: pathlib.Path, slug: str = "", allow_names: tuple[str, ...]
 
 
 def init_source(source: str, allow_names: tuple[str, ...] = (),
-                deny_names: tuple[str, ...] = (), derive: bool = False) -> Draft:
+                deny_names: tuple[str, ...] = (), derive: bool = False,
+                slug: str = "") -> Draft:
     allow = tuple(allow_names)
     deny = tuple(deny_names)
+    given = slug
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", source):
-        return from_page(source, "Demo", allow_names=allow, deny_names=deny, derive=derive)
+        return from_page(source, "Demo", slug=given, allow_names=allow, deny_names=deny, derive=derive)
     path = pathlib.Path(source)
     if path.is_file() and (path.suffix.lower() in {".md", ".markdown"} or path.name.lower().startswith("readme")):
-        return from_readme(path, slug=repo_slug(path.parent), allow_names=allow, deny_names=deny, derive=derive)
+        return from_readme(path, slug=given or repo_slug(path.parent), allow_names=allow, deny_names=deny, derive=derive)
     if path.is_dir():
         readme = None
         for name in ("README.md", "Readme.md", "readme.md"):
@@ -529,7 +573,7 @@ def init_source(source: str, allow_names: tuple[str, ...] = (),
             if candidate.is_file():
                 readme = candidate
                 break
-        slug = repo_slug(path)
+        slug = given or repo_slug(path)
         if readme is not None:
             return from_readme(readme, slug=slug, allow_names=allow, deny_names=deny, derive=derive)
         html = _find_html(path)
@@ -537,6 +581,6 @@ def init_source(source: str, allow_names: tuple[str, ...] = (),
             raise ShotListError(f"no HTML fixture under {path}")
         return from_page(html.resolve().as_uri(), slug, slug=slug, allow_names=allow, deny_names=deny, derive=derive)
     if path.is_file():
-        slug = repo_slug(path)
+        slug = given or repo_slug(path)
         return from_page(path.resolve().as_uri(), slug, slug=slug, allow_names=allow, deny_names=deny, derive=derive)
     raise ShotListError(f"init source not found: {source}")

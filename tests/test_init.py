@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from scripts.fleet_check import diff_status
+from scripts.fleet_check import diff_status
 from demo_director.propose import (
     Control, PageControls, display_title, draft_from, dump_draft, human_title, init_source, synthetic_value,
 )
@@ -138,19 +140,69 @@ class InitTests(unittest.TestCase):
         self.assertEqual(display_title("Ravens Playbook Lab", "ravens-playbook"), "Ravens Playbook Lab")
         self.assertEqual(display_title("The Fleet '26 · Yearbook", "fleet-yearbook"), "The Fleet '26 · Yearbook")
         self.assertEqual(display_title("", "four-game-jam"), "Four Game Jam")
-        self.assertEqual(display_title("FOUR-GAMEJAM", "four-game-jam"), "FOUR-GAMEJAM")
+        self.assertEqual(display_title("CHOPSTICKS", "chopsticks"), "Chopsticks")
+        self.assertEqual(display_title("Ravens Season Sim", "ravens-sim"), "Ravens Season Sim")
+        self.assertEqual(display_title("FOUR-GAMEJAM", "four-game-jam"), "Four Game Jam")
+        self.assertEqual(display_title("Four-Game Jam", "four-game-jam"), "Four Game Jam")
+        self.assertEqual(display_title("API Solomon Dugout", "api-dugout"), "API Solomon Dugout")
+        self.assertEqual(display_title("RAVENS GAME DAY HQ", ""), "Ravens Game Day HQ")
         self.assertEqual(display_title("Weekend Planner", "demo-director"), "Weekend Planner")
-        folder = pathlib.Path(tempfile.mkdtemp()) / "four-game-jam"
-        folder.mkdir()
-        (folder / "index.html").write_text(
-            "<style>body{margin:0;padding:28px;background:#111;color:#eee;font-family:system-ui}</style>"
-            "<h1>Starship Tower</h1>"
-            "<p>Synthetic jam for a Saturday session with orange cones ready today.</p>"
-            "<button id=play>Play</button>"
+
+    def test_three_repo_title_shapes(self):
+        """Shouted h1, CSS uppercase over mixed text, and an empty h1."""
+        body = (
+            "<style>body{margin:0;background:#102;color:#eee;font-family:system-ui}"
+            ".grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:16px}"
+            ".card{min-height:140px;color:#fff;padding:16px}</style>"
+            "<p>Synthetic board for a Saturday session with orange cones ready today.</p>"
+            "<div class=grid><div class=card style=\"background:#7c2d12\">Cones</div>"
+            "<div class=card style=\"background:#14532d\">Pinnies</div></div>"
         )
-        draft = init_source(str(folder))
-        self.assertEqual(draft.shotlist.title, "Starship Tower")
-        self.assertEqual(draft.shotlist.steps[0].text, "Starship Tower")
+        root = pathlib.Path(tempfile.mkdtemp())
+        sticks = root / "chopsticks"
+        sticks.mkdir()
+        (sticks / "index.html").write_text(
+            "<title>Chopsticks · a booster catch game</title>"
+            "<style>h1{text-transform:uppercase}</style>"
+            "<h1>CHOPSTICKS</h1>" + body
+        )
+        season = root / "ravens-sim"
+        season.mkdir()
+        (season / "index.html").write_text(
+            "<title>Ravens Season Sim 2026</title>"
+            "<style>h1{text-transform:uppercase;letter-spacing:2px}</style>"
+            "<h1>Ravens Season Sim</h1>" + body
+        )
+        jam = root / "four-game-jam"
+        jam.mkdir()
+        (jam / "index.html").write_text(
+            "<title>Four-Game Jam</title>"
+            "<h1></h1><div class=logo>FOUR-GAMEJAM</div>" + body
+        )
+        logo = root / "four-game-jam-logo"
+        logo.mkdir()
+        (logo / "index.html").write_text(
+            "<title>Four-Game Jam</title>"
+            "<h1><span>FOUR</span><span>-GAME</span><span>JAM</span></h1>" + body
+        )
+        self.assertEqual(init_source(str(sticks)).shotlist.title, "Chopsticks")
+        self.assertEqual(init_source(str(season)).shotlist.title, "Ravens Season Sim")
+        self.assertEqual(init_source(str(jam)).shotlist.title, "Four Game Jam")
+        # The logo directory name is not the slug, so pass it the way the harness does.
+        self.assertEqual(
+            init_source(str(logo), slug="four-game-jam").shotlist.title,
+            "Four Game Jam",
+        )
+
+    def test_fleet_expect_diff_lists_each_repo(self):
+        lines = diff_status(
+            [{"repo": "alpha", "bucket": "ok"}, {"repo": "beta", "bucket": "blank"}],
+            {"alpha": "ok", "beta": "name-blocked", "gamma": "blank"},
+        )
+        self.assertEqual(lines, [
+            "beta\texpected name-blocked\tactual blank",
+            "gamma\texpected blank\tmissing-from-run",
+        ])
 
     def test_reserved_email_in_a_readme_is_allowed(self):
         folder = pathlib.Path(tempfile.mkdtemp())

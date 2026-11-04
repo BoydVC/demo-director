@@ -56,10 +56,11 @@ def _init(argv: list[str]) -> int:
     ap.add_argument("--allow-name", action="append", default=[])
     ap.add_argument("--deny-name", action="append", default=[])
     ap.add_argument("--derive-names", action="store_true")
+    ap.add_argument("--slug", default="")
     a = ap.parse_args(argv)
     try:
         data = dump_draft(init_source(
-            a.target, tuple(a.allow_name), tuple(a.deny_name), a.derive_names,
+            a.target, tuple(a.allow_name), tuple(a.deny_name), a.derive_names, slug=a.slug,
         ))
     except RecordingFailure as exc:
         print(json.dumps(_failure_payload(exc)))

@@ -2,12 +2,15 @@
 
 Every step goes through ``session.run_step``. The only way to append a beat is
 for that call to return ``captured`` with the beat count increased by one.
-PII, a missing selector, or a timeout returns a typed failure and no beat.
+A missing selector, a control that is not visible, a refused navigation, an
+invalid value, a blank page, a timeout, or PII returns a typed failure and
+no beat.
 """
 from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,10 +20,10 @@ from pathlib import Path
 from PIL import Image
 
 from . import compose
-from .guard import hits
+from .guard import hits, load_deny_terms, locate_denied, name_detail
 from .session import Phase, RecordingFailure, Session, StepSignals, run_step
 from .shotlist import ASPECTS, FIXTURE_URL
-from .types import Beat, Box, ShotList, step_selector, step_text
+from .types import Beat, BlankPolicy, Box, ShotList, step_selector, step_text
 
 TITLE_FRAMES = 12
 END_FRAMES = 12
@@ -108,9 +111,22 @@ _LABEL_JS = """
   }
   function collectLines() {
     const out = [];
-    document.querySelectorAll("h1,h2,h3,button,.card,.sub,#conf,#status,.tag,label,p").forEach((node) => {
+    const push = (box) => {
+      if (!box || box.w < 8 || box.h < 8 || box.h > 180) return;
+      out.push(box);
+    };
+    document.querySelectorAll("h1,h2,h3,h4,header,button,.card,.sub,.hero,.kick,#conf,#status,.tag,label,p,[role=heading]").forEach((node) => {
+      push(ink(node));
+    });
+    // Left-aligned blocks the zoom must not slice, even when they are not the
+    // control's own label. A div title is the usual shape.
+    document.querySelectorAll("div,span,li,strong,a").forEach((node) => {
+      if (node.childElementCount > 2) return;
       const box = ink(node);
-      if (box.w > 4 && box.h > 4 && box.h < 90) out.push(box);
+      if (!box || box.x > 120) return;
+      const text = (node.innerText || "").trim();
+      if (text.length < 4 || text.length > 90) return;
+      push(box);
     });
     document.querySelectorAll("input, textarea").forEach((node) => {
       const r = node.getBoundingClientRect();
@@ -126,23 +142,74 @@ _LABEL_JS = """
 }
 """
 
-_TEXT_JS = """
+_LINES_JS = """
 () => {
-  if (!document.body) return "";
-  const parts = [];
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let node;
-  while ((node = walker.nextNode())) {
-    const text = (node.textContent || "").trim();
-    if (text) parts.push(text);
+  const rectOf = (r) => ({x: r.x, y: r.y, w: r.width, h: r.height});
+  function ink(node) {
+    const tag = node.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") {
+      return rectOf(node.getBoundingClientRect());
+    }
+    const text = (node.innerText || "").trim();
+    if (!text) return rectOf(node.getBoundingClientRect());
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const rects = [...range.getClientRects()].filter((r) => r.width > 0.5 && r.height > 0.5);
+    if (!rects.length) return rectOf(node.getBoundingClientRect());
+    const x0 = Math.min(...rects.map((r) => r.x));
+    const y0 = Math.min(...rects.map((r) => r.y));
+    const x1 = Math.max(...rects.map((r) => r.right));
+    const y1 = Math.max(...rects.map((r) => r.bottom));
+    return {x: x0, y: y0, w: x1 - x0, h: y1 - y0};
   }
-  document.querySelectorAll("input, textarea").forEach((el) => {
-    if (el.value) parts.push(el.value);
-    if (el.placeholder) parts.push(el.placeholder);
+  const out = [];
+  const push = (box) => {
+    if (!box || box.w < 8 || box.h < 8 || box.h > 180) return;
+    out.push(box);
+  };
+  document.querySelectorAll("h1,h2,h3,h4,header,button,.card,.sub,.hero,.kick,.brand,#conf,#status,.tag,label,p,[role=heading]").forEach((node) => {
+    push(ink(node));
   });
-  return parts.join("\\n");
+  document.querySelectorAll("div,span,li,strong,a").forEach((node) => {
+    if (node.childElementCount > 2) return;
+    const box = ink(node);
+    if (!box || box.x > 120) return;
+    const text = (node.innerText || "").trim();
+    if (text.length < 4 || text.length > 90) return;
+    push(box);
+  });
+  return out;
 }
 """
+
+_VIEWS_JS = """
+() => {
+  const visibleParts = [];
+  if (document.body) visibleParts.push(document.body.innerText || "");
+  document.querySelectorAll("input, textarea").forEach((el) => {
+    const style = getComputedStyle(el);
+    const shown = style.display !== "none" && style.visibility !== "hidden" && !el.closest("[hidden]");
+    if (!shown) return;
+    if (el.value) visibleParts.push(el.value);
+    if (el.placeholder) visibleParts.push(el.placeholder);
+  });
+  // The document title is not body text. A match there is source, not on screen.
+  return {visible: visibleParts.join("\\n"), source: document.title || ""};
+}
+"""
+
+
+def _page_views(page) -> tuple[str, str]:
+    """Visible on-screen text, then the rest of the document text."""
+    try:
+        raw = page.evaluate(_VIEWS_JS)
+    except Exception:
+        return "", ""
+    if not isinstance(raw, dict):
+        return "", ""
+    visible = raw.get("visible") if isinstance(raw.get("visible"), str) else ""
+    source = raw.get("source") if isinstance(raw.get("source"), str) else ""
+    return visible, source
 
 
 def resolve_fixture(sl: ShotList) -> ShotList:
@@ -175,32 +242,172 @@ def _box(raw) -> Box | None:
 
 
 def _page_text(page) -> str | None:
-    try:
-        text = page.evaluate(_TEXT_JS)
-    except Exception:
-        return None
-    return text if isinstance(text, str) else None
+    visible, source = _page_views(page)
+    if not visible and not source:
+        try:
+            text = page.evaluate("() => document.body ? (document.body.innerText || '') : ''")
+        except Exception:
+            return None
+        return text if isinstance(text, str) else None
+    return visible + "\n" + source
 
 
 def _snap(page) -> Image.Image:
     return Image.open(io.BytesIO(page.screenshot())).convert("RGB")
 
 
+def classify_failure(exc: BaseException, *, navigating: bool = False) -> str:
+    """Map a browser exception to the failure it actually is.
+
+    ``_perform`` used to send every exception down the timeout edge, so a
+    malformed date fill and a covered click both came back as timeout.
+    """
+    name = type(exc).__name__.casefold()
+    text = f"{name}: {exc}".casefold()
+    if any(token in text for token in (
+        "element is not visible",
+        "element is hidden",
+        "intercepts pointer",
+        "outside of the viewport",
+        "not attached to the dom",
+    )):
+        return "not-visible"
+    if any(token in text for token in (
+        "malformed value",
+        "invalid value",
+        "cannot type",
+        "cannot fill",
+    )):
+        return "invalid-value"
+    if any(token in text for token in (
+        "unknown engine",
+        "malformed selector",
+        "strict mode violation",
+        "no element matches",
+    )):
+        return "selector-missing"
+    network = any(token in text for token in (
+        "net::",
+        "ns_error",
+        "err_connection",
+        "err_name",
+        "err_address",
+        "err_aborted",
+        "err_failed",
+        "err_internet",
+        "err_socket",
+        "frame was detached",
+        "download is starting",
+        "page crashed",
+        "navigation failed",
+    ))
+    timed = "timeout" in name or "timeout" in text
+    if network:
+        return "nav-error"
+    if navigating:
+        return "timeout" if timed else "nav-error"
+    if timed:
+        return "timeout"
+    return "invalid-value"
+
+
+_PAGE_STATE_JS = """
+() => {
+  const text = document.body ? (document.body.innerText || "") : "";
+  const mainEl = document.querySelector("main, [role=main]");
+  const main = mainEl ? (mainEl.innerText || "") : "";
+  let styled = false;
+  for (const sheet of document.styleSheets) {
+    try {
+      if (sheet.cssRules && sheet.cssRules.length > 0) { styled = true; break; }
+    } catch (e) {
+      styled = true;
+      break;
+    }
+  }
+  const prominent = [...document.querySelectorAll("h1,h2,[role=alert],[role=status]")]
+    .map((el) => (el.innerText || "").trim()).filter(Boolean).join("\\n");
+  return {text, main, styled, prominent};
+}
+"""
+
+
+def page_problem(page, response, policy: BlankPolicy | None = None) -> str | None:
+    """Blank, unstyled, sparse, or an error page. None when the page is demoable.
+
+    A style tag with no rules (an unfilled ``/*__CSS__*/`` template) counts
+    as unstyled. A styled page with almost no copy, or with an error or
+    empty-state phrase, fails closed too. ``file:`` loads report status 0 or
+    200 and are not HTTP errors. ``policy`` replaces the default phrases and
+    the character floor.
+    """
+    rules = policy or BlankPolicy()
+    status = getattr(response, "status", None) if response is not None else None
+    if isinstance(status, int) and status >= 400:
+        return f"http-{status}"
+    try:
+        raw = page.evaluate(_PAGE_STATE_JS)
+    except Exception:
+        return "no-visible-text"
+    if not isinstance(raw, dict):
+        return "no-visible-text"
+    text = raw.get("text") if isinstance(raw.get("text"), str) else ""
+    main = raw.get("main") if isinstance(raw.get("main"), str) else ""
+    if not raw.get("styled"):
+        return "unstyled"
+    if not text.strip():
+        return "no-visible-text"
+    prominent = raw.get("prominent") if isinstance(raw.get("prominent"), str) else ""
+    # The main region can be an error shell while the header and footer
+    # still add enough characters to look like a page.
+    problem = rules.reason(text, prominent)
+    if problem:
+        return problem
+    # Header and footer can pad the body while main itself is the error.
+    # A short main that is not an error phrase is just a canvas game.
+    if main.strip() and main.strip() != text.strip():
+        main_problem = rules.reason(main, "")
+        if main_problem and main_problem.startswith("error-phrase"):
+            return main_problem
+    return None
+
+
+def refuse_unusable(page, response, step_index: int = -1, policy: BlankPolicy | None = None) -> None:
+    """Fail the take when the page is blank, unstyled, sparse, or an error page.
+
+    The reason is on the exception. Callers put it in the JSON status. Nothing
+    is written to stderr here.
+    """
+    problem = page_problem(page, response, policy)
+    if not problem:
+        return
+    raise RecordingFailure(
+        "blank-page",
+        step_index,
+        problem,
+        warning=f"page is not demoable: {problem}",
+    )
+
+
 def _probe(page, selector: str, timeout_ms: int = 3000):
-    """Return (found, box, label, lines, timed_out). Missing and timeout stay distinct."""
+    """Return (found, box, label, lines, problem).
+
+    ``problem`` is None, ``selector-missing``, ``not-visible``, or ``timeout``.
+    A node that exists but has no box is hidden, not missing.
+    """
     loc = page.locator(selector).first
     try:
         count = loc.count()
-    except Exception:
-        return False, None, None, (), True
+    except Exception as exc:
+        return False, None, None, (), classify_failure(exc)
     if count == 0:
-        return False, None, None, (), False
+        return False, None, None, (), "selector-missing"
     try:
         bb = loc.bounding_box(timeout=timeout_ms)
-    except Exception:
-        return False, None, None, (), True
+    except Exception as exc:
+        return False, None, None, (), classify_failure(exc)
     if not bb:
-        return False, None, None, (), False
+        return False, None, None, (), "not-visible"
     box = label = None
     lines: tuple[Box, ...] = ()
     try:
@@ -213,28 +420,42 @@ def _probe(page, selector: str, timeout_ms: int = 3000):
         lines = tuple(item for item in (_box(row) for row in (raw.get("lines") or [])) if item)
     if box is None:
         box = (bb["x"], bb["y"], bb["width"], bb["height"])
-    return True, box, label, lines, False
+    return True, box, label, lines, None
 
 
-def _perform(page, step) -> None:
+def _collect_lines(page) -> tuple[Box, ...]:
+    """Text boxes on the page as it is now, after a click has changed it."""
+    try:
+        raw = page.evaluate(_LINES_JS)
+    except Exception:
+        return ()
+    if not isinstance(raw, list):
+        return ()
+    return tuple(item for item in (_box(row) for row in raw) if item)
+
+
+def _perform(page, step, policy: BlankPolicy | None = None) -> None:
     if step.action == "goto":
-        page.goto(step.url, timeout=15000)
+        response = page.goto(step.url, timeout=15000)
+        refuse_unusable(page, response, policy=policy)
     elif step.action == "click":
         page.click(step.selector, timeout=5000)
     elif step.action == "type":
         page.fill(step.selector, step.text or "", timeout=5000)
 
 
-def _drive_step(page, session: Session, step, names: tuple[str, ...]) -> tuple[Session, Beat | None]:
+def _drive_step(page, session: Session, step, names: tuple[str, ...],
+                policy: BlankPolicy | None = None) -> tuple[Session, Beat | None]:
     """One chart step. A beat is returned only when ``run_step`` captures."""
     needs = step.action in {"click", "type", "zoom"}
     text = _page_text(page)
     pii = bool(hits(text, names))
-    found, box, label, lines, nav_timeout = True, None, None, (), False
+    found, box, label, lines, problem = True, None, None, (), None
     if needs and not pii:
-        found, box, label, lines, nav_timeout = _probe(page, step_selector(step) or "")
-    timeout_at = "navigating" if nav_timeout else None
-    pre = StepSignals(needs, found, timeout_at, pii, False)
+        found, box, label, lines, problem = _probe(page, step_selector(step) or "")
+    timeout_at = "navigating" if problem == "timeout" else None
+    action_error = None if problem in (None, "timeout") else problem
+    pre = StepSignals(needs, problem is None, timeout_at, pii, False, action_error)
     trial = run_step(session, pre)
     if trial.failure or trial.pii_seen:
         return trial, None
@@ -245,18 +466,21 @@ def _drive_step(page, session: Session, step, names: tuple[str, ...]) -> tuple[S
         failed = run_step(session, StepSignals(needs, found, "navigating", pii, False))
         return failed, None
 
-    acted_timeout = False
     try:
-        _perform(page, step)
-    except Exception:
-        acted_timeout = True
-    if acted_timeout:
+        _perform(page, step, policy)
+    except RecordingFailure:
+        raise
+    except Exception as exc:
+        # A navigation that destroys the document makes the read fail. That is
+        # the navigation error, not an unreadable-text PII hit. A string that
+        # actually contains a real address still blocks.
         text_after = _page_text(page)
-        pii_after = bool(hits(text_after, names))
-        if pii_after:
+        reasons = hits(text_after, names) if isinstance(text_after, str) else ()
+        if reasons:
             failed = run_step(session, StepSignals(needs, found, None, pii, True))
         else:
-            failed = run_step(session, StepSignals(needs, found, "acting", pii, False))
+            kind = classify_failure(exc, navigating=step.action == "goto")
+            failed = run_step(session, StepSignals(needs, found, None, pii, False, kind))
         return failed, None
 
     text_after = _page_text(page)
@@ -277,7 +501,190 @@ def _drive_step(page, session: Session, step, names: tuple[str, ...]) -> tuple[S
     except Exception:
         failed = run_step(session, StepSignals(needs, found, "settling", pii, pii_after))
         return failed, None
+    # The click auto-zoom is framed from this beat. Lines probed before the
+    # click miss a heading the click just revealed, so the crop slices it.
+    if step.action in {"click", "zoom"}:
+        fresh = _collect_lines(page)
+        if fresh:
+            lines = fresh
     return final, Beat(before, after, box, step, label, lines)
+
+
+def _name_failure(parts: tuple[str, ...] | list[str], step_index: int = -1) -> RecordingFailure:
+    detail = name_detail(parts)
+    return RecordingFailure("pii-blocked", step_index, detail, warning=detail)
+
+
+_CANVAS_BOX_JS = """
+() => {
+  const vw = window.innerWidth || 1;
+  const vh = window.innerHeight || 1;
+  const view = vw * vh;
+  const boxes = [];
+  for (const canvas of document.querySelectorAll("canvas")) {
+    const style = getComputedStyle(canvas);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) continue;
+    const rect = canvas.getBoundingClientRect();
+    const x0 = Math.max(0, rect.x);
+    const y0 = Math.max(0, rect.y);
+    const x1 = Math.min(vw, rect.right);
+    const y1 = Math.min(vh, rect.bottom);
+    const visible = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+    if (visible / view <= 0.5) continue;
+    boxes.push({x: x0, y: y0, w: x1 - x0, h: y1 - y0});
+  }
+  return boxes;
+}
+"""
+
+
+def _region_flat(image: Image.Image, box: dict) -> bool:
+    x = max(0, int(box.get("x", 0)))
+    y = max(0, int(box.get("y", 0)))
+    w = max(1, int(box.get("w", 1)))
+    h = max(1, int(box.get("h", 1)))
+    crop = image.crop((x, y, min(image.width, x + w), min(image.height, y + h)))
+    if crop.width < 2 or crop.height < 2:
+        return False
+    return _flat_ratio(crop) >= 0.9
+
+
+_CHROME_JS = """
+() => {
+  const vw = window.innerWidth || 1;
+  const vh = window.innerHeight || 1;
+  const shown = (el) => {
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2 && rect.bottom > 0 && rect.right > 0 && rect.top < vh;
+  };
+  const chrome = [];
+  for (const el of document.querySelectorAll("header, nav, footer, [role=banner], [role=navigation], [role=contentinfo]")) {
+    if (!shown(el)) continue;
+    if (el.querySelector("main, [role=main]")) continue;
+    chrome.push(el);
+  }
+  if (document.body) {
+    for (const el of document.body.querySelectorAll("*")) {
+      if (chrome.some((node) => node === el || node.contains(el) || el.contains(node))) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < vw * 0.55 || rect.height < 12 || rect.height > Math.min(160, vh * 0.28)) continue;
+      const style = getComputedStyle(el);
+      const pos = style.position;
+      const topBand = rect.top <= 2 && rect.height <= 88;
+      const pinnedTop = (pos === "fixed" || pos === "sticky") && rect.top <= 4 && rect.bottom < vh * 0.45;
+      const pinnedBottom = (pos === "fixed" || pos === "sticky" || pos === "absolute")
+        && rect.bottom >= vh - 3 && rect.height <= 56 && rect.top > vh * 0.5;
+      if (topBand || pinnedTop || pinnedBottom) chrome.push(el);
+    }
+  }
+  const inside = (el) => chrome.some((node) => node === el || node.contains(el));
+  const parts = [];
+  if (document.body) {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      const text = (textNode.textContent || "").trim();
+      const parent = textNode.parentElement;
+      if (!text || !parent) continue;
+      const tag = parent.tagName;
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
+      if (inside(parent)) continue;
+      parts.push(text);
+    }
+  }
+  let top = 0;
+  let bottom = vh;
+  for (const el of chrome) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < vw * 0.5 || rect.height > vh * 0.5) continue;
+    if (rect.bottom > top && rect.top <= top + 12) top = Math.max(top, Math.min(vh, rect.bottom));
+    if (rect.top < bottom && rect.bottom >= vh - 12) bottom = Math.min(bottom, Math.max(0, rect.top));
+  }
+  const height = Math.max(0, bottom - top);
+  return {
+    text: parts.join("\\n"),
+    box: height >= 8 ? {x: 0, y: top, w: vw, h: height} : null,
+  };
+}
+"""
+
+
+def _ink_ratio(image: Image.Image) -> float:
+    """Share of neighboring pixels with a hard edge.
+
+    A flat field and a smooth gradient stay near 0. Type, controls, and
+    pictures produce edges.
+    """
+    raw = _rgb_bytes(image, (96, 60))
+    width, height = 96, 60
+    ink = 0
+    total = 0
+    for y in range(height):
+        row = y * width
+        for x in range(width - 1):
+            left = (row + x) * 3
+            right = left + 3
+            delta = (
+                abs(raw[left] - raw[right])
+                + abs(raw[left + 1] - raw[right + 1])
+                + abs(raw[left + 2] - raw[right + 2])
+            )
+            total += 1
+            if delta >= 28:
+                ink += 1
+    if total == 0:
+        return 0.0
+    return ink / total
+
+
+def _chrome_only(page, policy: BlankPolicy) -> bool | None:
+    """True when chrome surrounds a main region with no copy and no edges."""
+    try:
+        raw = page.evaluate(_CHROME_JS)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    text = raw.get("text") if isinstance(raw.get("text"), str) else ""
+    meaningful = len(re.sub(r"[^0-9A-Za-z]", "", text))
+    if meaningful >= (policy.min_chars if policy else 48):
+        return False
+    box = raw.get("box")
+    if not isinstance(box, dict):
+        return True
+    shot = _snap(page)
+    crop_box = {
+        "x": box.get("x", 0),
+        "y": box.get("y", 0),
+        "w": box.get("w", shot.width),
+        "h": box.get("h", shot.height),
+    }
+    x = max(0, int(crop_box["x"]))
+    y = max(0, int(crop_box["y"]))
+    w = max(1, int(crop_box["w"]))
+    h = max(1, int(crop_box["h"]))
+    crop = shot.crop((x, y, min(shot.width, x + w), min(shot.height, y + h)))
+    if crop.width < 2 or crop.height < 2:
+        return True
+    return _ink_ratio(crop) < 0.015
+
+
+def _dominant_canvas_blank(page) -> bool | None:
+    """True when a canvas covering most of the viewport is a flat empty field."""
+    try:
+        boxes = page.evaluate(_CANVAS_BOX_JS)
+    except Exception:
+        return None
+    if not isinstance(boxes, list) or not boxes:
+        return None
+    shot = _snap(page)
+    return all(_region_flat(shot, box) for box in boxes if isinstance(box, dict))
+
+
+def _caption_texts(sl: ShotList) -> list[str]:
+    return [text for step in sl.steps if (text := step_text(step)) and step.action == "caption"]
 
 
 def record(sl: ShotList) -> list[Beat]:
@@ -285,12 +692,17 @@ def record(sl: ShotList) -> list[Beat]:
     from playwright.sync_api import sync_playwright
 
     sl = resolve_fixture(sl)
-    names = sl.pii.names
+    names = tuple(dict.fromkeys(tuple(sl.pii.names) + load_deny_terms()))
+    captions = _caption_texts(sl)
     session = Session.idle()
-    blob = hits(shotlist_blob(sl), names)
+    blob = hits(shotlist_blob(sl), ())
     if blob:
         blocked = run_step(session, StepSignals(False, True, None, True, False))
         raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(blob))
+    # Title and end cards both draw sl.title. Captions are their own steps.
+    named = locate_denied(names, title=sl.title, captions=captions)
+    if named:
+        raise _name_failure(named)
 
     beats: list[Beat] = []
     with sync_playwright() as p:
@@ -298,21 +710,76 @@ def record(sl: ShotList) -> list[Beat]:
         try:
             page = browser.new_page(viewport={"width": sl.viewport[0], "height": sl.viewport[1]})
             try:
-                page.goto(sl.url, timeout=15000)
+                response = page.goto(sl.url, timeout=15000)
             except Exception as exc:
-                raise RecordingFailure("timeout", -1, "navigation") from exc
-            opening = _page_text(page)
-            opening_hits = hits(opening, names)
+                kind = classify_failure(exc, navigating=True)
+                raise RecordingFailure(kind, -1, "navigation") from exc
+            visible, source = _page_views(page)
+            opening = (visible + "\n" + source) if (visible or source) else _page_text(page)
+            opening_hits = hits(opening, ())
             if opening_hits:
                 blocked = run_step(session, StepSignals(False, True, None, True, False))
                 raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(opening_hits))
+            seen = locate_denied(names, page=visible, page_source=source)
+            if seen:
+                raise _name_failure(seen)
+            opened = visible
+            clicked = False
+            policy = sl.blank or BlankPolicy()
+            refuse_unusable(page, response, policy=policy)
+            page.wait_for_timeout(250)
+            canvas_flags = [_dominant_canvas_blank(page)]
+            chrome_flags = [_chrome_only(page, policy)]
             for index, step in enumerate(sl.steps):
-                session, beat = _drive_step(page, session, step, names)
+                try:
+                    session, beat = _drive_step(page, session, step, names, policy)
+                except RecordingFailure as exc:
+                    selector = exc.selector or step_selector(step) or ""
+                    raise RecordingFailure(exc.kind, index, exc.detail, selector) from exc
                 if beat is None:
-                    raise RecordingFailure(session.failure or "timeout", index, session.failure or "no beat")
+                    selector = step_selector(step) or getattr(step, "url", "") or ""
+                    detail = session.failure or "no beat"
+                    if session.failure == "pii-blocked":
+                        later_visible, later_source = _page_views(page)
+                        named = locate_denied(
+                            names, page=later_visible, page_source=later_source,
+                            opened=opened if clicked or step.action == "click" else None,
+                        )
+                        if named:
+                            raise _name_failure(named, index)
+                        reasons = hits(later, ())
+                        detail = ",".join(reasons) or "pii"
+                    elif session.failure == "nav-error":
+                        detail = "navigation"
+                    elif session.failure == "invalid-value":
+                        detail = "invalid-value"
+                    elif session.failure == "not-visible":
+                        detail = "not-visible"
+                    raise RecordingFailure(session.failure or "timeout", index, detail, selector)
                 beats.append(beat)
                 if session.beats != len(beats):
                     raise RecordingFailure("timeout", index, "beat invariant")
+                if step.action == "click":
+                    clicked = True
+                later_visible, later_source = _page_views(page)
+                step_hit = locate_denied(
+                    names, page=later_visible, page_source=later_source,
+                    opened=opened if clicked else None,
+                )
+                if step_hit:
+                    raise _name_failure(step_hit, index)
+                canvas_flags.append(_dominant_canvas_blank(page))
+                chrome_flags.append(_chrome_only(page, policy))
+            if canvas_flags and all(flag is True for flag in canvas_flags):
+                raise RecordingFailure(
+                    "blank-page", -1, "empty-canvas",
+                    warning="page is not demoable: empty-canvas",
+                )
+            if chrome_flags and all(flag is True for flag in chrome_flags):
+                raise RecordingFailure(
+                    "blank-page", -1, "chrome-only",
+                    warning="page is not demoable: chrome-only",
+                )
         finally:
             browser.close()
     return beats
@@ -327,14 +794,23 @@ def lead_line(sl: ShotList) -> str | None:
 
 
 def _frame(box, size, amount, label, lines=()):
-    """Crop that keeps the target and its label, then slides off any sliced text."""
+    """Crop that keeps the target, its label, and any left-aligned text it would cut."""
     if box is None or amount <= 0:
         return compose.frame_rect(None, size, 0, None)
     focus = label if label is not None else box
     crop = compose.frame_rect(box, size, amount, focus)
     must = tuple(item for item in (box, focus) if item)
     if lines:
-        crop = compose.unsliced(crop, tuple(lines), must, size)
+        opened = crop
+        crop = compose.contain_left_text(crop, tuple(lines), must, size)
+        # Anything the widen step pulled in, including a heading the click
+        # just showed, has to stay inside. unsliced may still slide off some
+        # other row.
+        kept = tuple(
+            line for line in lines
+            if compose._inside(line, crop) and line[0] < opened[0] - 0.25
+        )
+        crop = compose.unsliced(crop, tuple(lines), must + kept, size)
     return crop
 
 
@@ -342,9 +818,15 @@ def _content_frames(beats: list[Beat], out: tuple[int, int], aspect: str):
     cursor = (beats[0].before.width / 2, beats[0].before.height / 2)
     caption = None
     zoom_t, zoom_box, zoom_label = 0.0, None, None
+    # Hold and caption beats do not probe a selector, so they carry no text
+    # boxes. Keep the lines from the zoom that is still on screen; otherwise
+    # the hold recomputes a tight crop and slices the heading the zoom just fit.
+    zoom_lines: tuple = ()
     for beat in beats:
         step = beat.step
-        lines = beat.lines
+        if beat.lines:
+            zoom_lines = beat.lines
+        lines = beat.lines or zoom_lines
         if step.action == "caption":
             caption = step_text(step)
             crop = _frame(zoom_box, beat.after.size, zoom_t, zoom_label, lines)
@@ -391,6 +873,46 @@ def frames_for(beats: list[Beat], out: tuple[int, int], title: str = "", aspect:
         yield compose.end_card(out, title, (i + 1) / END_FRAMES)
 
 
+def fallback_plan(scale: float, fps: int) -> list[tuple[float, int]]:
+    """Scale and fps pairs to try when a GIF is over the byte budget.
+
+    The first pair is the request. Later pairs halve the frame rate, then
+    drop the scale by a third, and stop around a quarter of the frame or 4 fps.
+    """
+    s = float(scale)
+    original = max(1, int(fps))
+    f = original
+    plan: list[tuple[float, int]] = []
+    for _ in range(5):
+        pair = (round(s, 4), int(f))
+        if pair not in plan and s > 0 and f >= 1:
+            plan.append(pair)
+        if f > 5:
+            f = max(4, f // 2)
+            continue
+        nxt = round(s * 0.67, 4)
+        if nxt < 0.24 or nxt >= s:
+            break
+        s, f = nxt, original
+    return plan or [(round(float(scale), 4), original)]
+
+
+def _decimate(frames: list, source_fps: int, fps: int) -> list:
+    """Drop frames so a lower playback rate is actually a smaller GIF."""
+    if fps >= source_fps or source_fps < 1:
+        return frames
+    stride = max(1, int(source_fps / fps))
+    chosen = frames[::stride]
+    return chosen or frames[:1]
+
+
+def _under_budget(results: dict, budget: int) -> bool:
+    for info in results.values():
+        if os.path.getsize(info["gif"]) > budget:
+            return False
+    return True
+
+
 def encode(frames_dir: str, fps: int, gif: str, mp4: str | None) -> None:
     pattern = os.path.join(frames_dir, "f%05d.png")
     vf = (
@@ -410,9 +932,7 @@ def encode(frames_dir: str, fps: int, gif: str, mp4: str | None) -> None:
         )
 
 
-def direct(sl: ShotList, outdir: str, scale: float = 0.6) -> dict:
-    os.makedirs(outdir, exist_ok=True)
-    beats = record(sl)
+def _write(sl: ShotList, beats: list, outdir: str, scale: float, fps: int) -> dict:
     subtitle = lead_line(sl)
     results = {}
     for aspect in sl.aspects:
@@ -420,21 +940,86 @@ def direct(sl: ShotList, outdir: str, scale: float = 0.6) -> dict:
         out = (int(width * scale) // 2 * 2, int(height * scale) // 2 * 2)
         tmp = tempfile.mkdtemp()
         try:
-            n = -1
-            for n, frame in enumerate(frames_for(beats, out, title=sl.title, aspect=aspect.value, subtitle=subtitle)):
-                frame.save(os.path.join(tmp, f"f{n:05d}.png"))
-            if n < 0:
+            frames = _decimate(
+                list(frames_for(beats, out, title=sl.title, aspect=aspect.value, subtitle=subtitle)),
+                sl.fps,
+                fps,
+            )
+            if not frames:
                 raise RuntimeError("no frames")
+            for n, frame in enumerate(frames):
+                frame.save(os.path.join(tmp, f"f{n:05d}.png"))
             slug = aspect.value.replace(":", "x")
             gif = os.path.join(outdir, f"demo-{slug}.gif")
             mp4 = os.path.join(outdir, f"demo-{slug}.mp4")
-            encode(tmp, sl.fps, gif, mp4)
-            total = n + 1
-            content = total - TITLE_FRAMES - END_FRAMES
-            still_index = TITLE_FRAMES + max(0, content - 1)
+            encode(tmp, fps, gif, mp4)
+            total = len(frames)
+            content = max(0, total - TITLE_FRAMES - END_FRAMES)
+            still_index = min(total - 1, TITLE_FRAMES + max(0, content - 1))
             still = os.path.join(outdir, f"still-{slug}.png")
             shutil.copy(os.path.join(tmp, f"f{still_index:05d}.png"), still)
-            results[aspect.value] = {"gif": gif, "mp4": mp4, "frames": total, "still": still}
+            results[aspect.value] = {
+                "gif": gif, "mp4": mp4, "frames": total, "still": still,
+                "scale": scale, "fps": fps,
+            }
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+    return results
+
+
+def _rgb_bytes(image: Image.Image, size: tuple[int, int]) -> bytes:
+    return image.convert("RGB").resize(size).tobytes()
+
+
+def _flat_ratio(image: Image.Image) -> float:
+    """Share of pixels that fall in the single most common coarse color."""
+    raw = _rgb_bytes(image, (80, 50))
+    buckets: dict[tuple[int, int, int], int] = {}
+    count = len(raw) // 3
+    for index in range(0, len(raw), 3):
+        key = (raw[index] // 24, raw[index + 1] // 24, raw[index + 2] // 24)
+        buckets[key] = buckets.get(key, 0) + 1
+    return max(buckets.values()) / count
+
+
+def _mean_delta(left: Image.Image, right: Image.Image) -> float:
+    a = _rgb_bytes(left, (64, 40))
+    b = _rgb_bytes(right, (64, 40))
+    total = sum(abs(one - two) for one, two in zip(a, b))
+    return total / len(a)
+
+
+def _empty_body(beats: list[Beat]) -> str | None:
+    """Body frames that never change and are almost one flat color.
+
+    Title and end cards are not part of the beats. A rich page that sits
+    still is not flat, so a hold on a real screen still renders.
+    """
+    shots = [beat.before for beat in beats] + [beat.after for beat in beats]
+    shots = [shot for shot in shots if shot is not None]
+    if len(shots) < 2:
+        return None
+    # Near-solid walls only. A dark poster with real copy sits under this.
+    if not _flat_ratio(shots[0]) >= 0.95:
+        return None
+    if any(_mean_delta(shots[0], shot) >= 8 for shot in shots[1:]):
+        return None
+    return "empty-frames"
+
+
+def direct(sl: ShotList, outdir: str, scale: float = 0.6, budget: int | None = None) -> dict:
+    """Record once. When ``budget`` is set, re-encode over-budget GIFs at a lower fps or scale."""
+    os.makedirs(outdir, exist_ok=True)
+    beats = record(sl)
+    empty = _empty_body(beats)
+    if empty:
+        raise RecordingFailure("blank-page", -1, empty, warning=f"page is not demoable: {empty}")
+    plan = fallback_plan(scale, sl.fps) if budget is not None else [(float(scale), int(sl.fps))]
+    results: dict = {}
+    for attempt, (s, fps) in enumerate(plan, start=1):
+        results = _write(sl, beats, outdir, s, fps)
+        for row in results.values():
+            row["attempts"] = attempt
+        if budget is None or _under_budget(results, budget):
+            return results
     return results

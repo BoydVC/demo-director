@@ -8,6 +8,7 @@ import re
 from .types import (
     ASPECTS,
     Aspect,
+    BlankPolicy,
     Caption,
     Click,
     Goto,
@@ -51,27 +52,67 @@ def _step(i: int, raw: object) -> Step:
         raise ShotListError(f"step {i}: {exc}") from exc
 
 
+def _string_list(raw: object, label: str) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ShotListError(f"{label} must be a list of strings")
+    return list(raw)
+
+
 def _names(data: dict) -> PiiPolicy:
-    """``pii.names`` and ``deny_names`` are the same denylist, accepted at the boundary."""
+    """``pii.names`` and ``deny_names`` are the strict denylist.
+
+    ``pii.watch`` is derived from a README or title and only blocks when the
+    term is rendered. ``pii.allow`` drops watch terms.
+    """
     names: list[str] = []
+    watch: list[str] = []
+    allow: list[str] = []
     if "pii" in data and data["pii"] is not None:
         raw = data["pii"]
         if not isinstance(raw, dict):
             raise ShotListError("pii must be an object")
-        extra = raw.get("names") or []
-        if not isinstance(extra, list) or not all(isinstance(name, str) for name in extra):
-            raise ShotListError("pii.names must be a list of strings")
-        names.extend(extra)
+        names.extend(_string_list(raw.get("names") or [], "pii.names"))
+        watch.extend(_string_list(raw.get("watch") or [], "pii.watch"))
+        allow.extend(_string_list(raw.get("allow") or [], "pii.allow"))
     if "deny_names" in data:
-        extra = data["deny_names"]
-        if not isinstance(extra, list) or not all(isinstance(name, str) for name in extra):
-            raise ShotListError("deny_names must be a list of strings")
-        names.extend(extra)
-    seen: list[str] = []
-    for name in names:
-        if name not in seen:
-            seen.append(name)
-    return PiiPolicy(names=tuple(seen))
+        names.extend(_string_list(data["deny_names"], "deny_names"))
+    if "allow_names" in data:
+        allow.extend(_string_list(data["allow_names"], "allow_names"))
+
+    def unique(items: list[str]) -> tuple[str, ...]:
+        seen: list[str] = []
+        for name in items:
+            if name not in seen:
+                seen.append(name)
+        return tuple(seen)
+
+    return PiiPolicy(names=unique(names), allow=unique(allow), watch=unique(watch))
+
+
+def _blank(data: dict) -> BlankPolicy | None:
+    """Missing key means the built-in fail-closed policy. An object replaces it."""
+    if "blank" not in data or data["blank"] is None:
+        return None
+    raw = data["blank"]
+    if not isinstance(raw, dict):
+        raise ShotListError("blank must be an object")
+    patterns = raw.get("patterns", BlankPolicy().patterns)
+    if not isinstance(patterns, list) or not all(isinstance(item, str) for item in patterns):
+        raise ShotListError("blank.patterns must be a list of strings")
+    try:
+        min_chars = int(raw.get("min_chars", BlankPolicy.min_chars))
+    except (TypeError, ValueError):
+        raise ShotListError("blank.min_chars must be an integer") from None
+    if min_chars < 0:
+        raise ShotListError("blank.min_chars must be an integer")
+    for pattern in patterns:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ShotListError(f"blank.patterns: {exc}") from exc
+    return BlankPolicy(min_chars, tuple(patterns))
 
 
 def parse(data: dict) -> ShotList:
@@ -106,6 +147,7 @@ def parse(data: dict) -> ShotList:
         (width, height),
         fps,
         _names(data),
+        _blank(data),
     )
 
 
@@ -128,9 +170,21 @@ def dump(shotlist: ShotList) -> dict:
         "fps": shotlist.fps,
         "steps": steps,
     }
-    if shotlist.pii.names:
-        data["pii"] = {"names": list(shotlist.pii.names)}
-        data["deny_names"] = list(shotlist.pii.names)
+    if shotlist.pii.names or shotlist.pii.watch or shotlist.pii.allow:
+        policy: dict = {}
+        if shotlist.pii.names:
+            policy["names"] = list(shotlist.pii.names)
+            data["deny_names"] = list(shotlist.pii.names)
+        if shotlist.pii.watch:
+            policy["watch"] = list(shotlist.pii.watch)
+        if shotlist.pii.allow:
+            policy["allow"] = list(shotlist.pii.allow)
+        data["pii"] = policy
+    if shotlist.blank is not None:
+        data["blank"] = {
+            "min_chars": shotlist.blank.min_chars,
+            "patterns": list(shotlist.blank.patterns),
+        }
     return data
 
 

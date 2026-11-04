@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Keyboard Kickoff</title>
+<style>
+  body { margin: 0; background: #0e1726; color: #e8eef8; font-family: system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 22px; background: #121c2e; }
+  .brand { font-weight: 800; font-size: 22px; }
+  nav { margin-left: auto; display: flex; gap: 8px; }
+  nav button { background: transparent; color: #d5deee; border: 0; border-radius: 999px; padding: 8px 14px; font-size: 15px; }
+  nav button.on { background: #1f8a4c; color: white; }
+  main { padding: 8px 22px 28px; }
+  h1 { margin: 10px 0 4px; font-size: 34px; }
+  .sub { color: #9fb0c8; margin: 0 0 14px; }
+  .keys { display: grid; grid-template-columns: repeat(10, 1fr); gap: 6px; max-width: 760px; }
+  .keys b { background: #1c2838; border-radius: 8px; text-align: center; padding: 14px 0; font-weight: 600; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Keyboard Kickoff</div>
+  <nav>
+    <button type="button">Home</button>
+    <button type="button">Lessons</button>
+    <button type="button">Practice</button>
+    <button type="button" id="locker">Locker Room</button>
+  </nav>
+</header>
+<main>
+  <section id="home">
+    <h1>Practice Court</h1>
+    <p>Synthetic drills for a Saturday session. Press a key to start the round.</p>
+  </section>
+  <section id="room" hidden>
+    <h1 id="title">Player's Locker Room</h1>
+    <p class="sub">All time. Synthetic stats for a Saturday session, no real players.</p>
+    <div class="keys">
+      <b>Q</b><b>W</b><b>E</b><b>R</b><b>T</b><b>Y</b><b>U</b><b>I</b><b>O</b><b>P</b>
+      <b>A</b><b>S</b><b>D</b><b>F</b><b>G</b><b>H</b><b>J</b><b>K</b><b>L</b><b>;</b>
+    </div>
+  </section>
+</main>
+<script>
+  document.getElementById("locker").onclick = () => {
+    document.getElementById("home").hidden = true;
+    document.getElementById("room").hidden = false;
+    document.getElementById("locker").className = "on";
+  };
+</script>
+</body>
+</html>

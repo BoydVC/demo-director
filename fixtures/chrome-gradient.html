@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Empty Stage</title>
+<style>
+  html, body { margin: 0; height: 100%; background: radial-gradient(ellipse at 50% 30%, #3a3f4b, #16181d 70%); color: #e5e7eb; font-family: system-ui, sans-serif; }
+  #bar { height: 46px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; background: rgba(0,0,0,.35); }
+  a { color: #e5e7eb; text-decoration: none; margin-left: 10px; }
+  #stage { position: absolute; top: 46px; left: 0; right: 0; bottom: 24px; }
+  #hint { position: absolute; bottom: 4px; width: 100%; text-align: center; color: #9ca3af; font-size: 12px; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <span>Empty Stage</span>
+    <span><a href="#prev">Prev</a><a href="#next">Next</a></span>
+  </div>
+  <div id="stage"></div>
+  <div id="hint">click a page or use the arrows to flip</div>
+</body>
+</html>

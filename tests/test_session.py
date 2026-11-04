@@ -68,3 +68,13 @@ class StatechartTests(unittest.TestCase):
     def test_illegal_edge_is_not_a_beat(self):
         with self.assertRaises(InvalidTransition):
             transition(Session.idle(), Event.CAPTURE)
+
+    def test_action_error_is_its_own_kind_and_not_a_beat(self):
+        for kind in ("not-visible", "nav-error", "invalid-value", "selector-missing", "timeout"):
+            out = run_step(Session.idle(), StepSignals(True, True, None, False, False, kind))
+            self.assertEqual(out.failure, kind)
+            self.assertEqual(out.beats, 0)
+            self.assertIn(out.phase, FAILURES)
+        blocked = run_step(Session.idle(), StepSignals(True, True, None, True, False, "not-visible"))
+        self.assertIs(blocked.phase, Phase.PII_BLOCKED)
+        self.assertEqual(blocked.beats, 0)

@@ -152,6 +152,117 @@ class FramingTests(unittest.TestCase):
         self.assertGreater(_near_white(end), 30)
         self.assertNotEqual(list(card.getdata())[::80], list(end.getdata())[::80])
 
+    def test_long_title_fits_the_card(self):
+        title = "Mission Control · SpaceX · Starship · Starlink"
+        for size in ((1280, 720), (1080, 1080), (720, 1280), (360, 640)):
+            card = compose.title_card(size, title, 1)
+            end = compose.end_card(size, title, 1)
+            for img in (card, end):
+                self.assertEqual(img.size, size)
+                self.assertEqual(_edge_ink(img), 0, size)
+            limit = size[0] * 0.9
+            probe = __import__("PIL").ImageDraw.Draw(card)
+            face = compose._fit(probe, title, max(26, size[0] // 16), "bold", size[0])
+            self.assertLessEqual(compose._measure(title, face), limit + 0.5)
+
+    def test_zoom_contains_the_left_aligned_block(self):
+        size = (1280, 800)
+        target = (1080, 180, 150, 44)
+        label = (900, 180, 160, 44)
+        heading = (28, 36, 680, 48)
+        kick = (28, 96, 420, 36)
+        naive = compose.frame_rect(target, size, 1, label)
+        self.assertLess(heading[0], naive[0])
+        self.assertTrue(compose._hits(heading, naive) or heading[1] < naive[1] + naive[3])
+        crop = compose.contain_left_text(naive, (heading, kick), (target, label), size)
+        for box in (heading, kick, target, label):
+            _inside(self, box, crop)
+        self.assertLessEqual(crop[0], heading[0])
+        self.assertLessEqual(crop[0] + crop[2], size[0] + 0.5)
+        self.assertLessEqual(crop[1] + crop[3], size[1] + 0.5)
+
+    def test_terps_and_kickoff_zoom_keeps_the_left_titles(self):
+        from demo_director.director import _frame, record
+        data = example()
+        data["url"] = (ROOT / "fixtures" / "left-crop.html").resolve().as_uri()
+        data["title"] = "Left crop"
+        data["steps"] = [{"action": "zoom", "selector": "#zoom-me", "frames": 4}]
+        beats = record(parse(data))
+        self.assertEqual(len(beats), 1)
+        beat = beats[0]
+        size = beat.before.size
+        naive = compose.frame_rect(beat.box, size, 1, beat.label)
+        left = [line for line in beat.lines if line[0] <= size[0] * 0.12 and line[2] >= 80]
+        self.assertGreaterEqual(len(left), 2, beat.lines)
+        sliced = [line for line in left if line[0] < naive[0] - 0.5 and _vertically(line, naive)]
+        self.assertGreaterEqual(len(sliced), 1, (naive, left))
+        crop = _frame(beat.box, size, 1, beat.label, beat.lines)
+        for line in left:
+            if _vertically(line, naive):
+                _inside(self, line, crop)
+        _inside(self, beat.box, crop)
+        self.assertLessEqual(crop[0], min(line[0] for line in sliced) + 0.5)
+        # The still is the hold after the zoom. That beat has no selector, so
+        # it used to drop the text boxes and crop the heading again.
+        data["steps"] = [
+            {"action": "zoom", "selector": "#zoom-me", "frames": 4},
+            {"action": "hold", "frames": 4},
+        ]
+        held = record(parse(data))
+        self.assertEqual([beat.step.action for beat in held], ["zoom", "hold"])
+        self.assertEqual(held[1].lines, ())
+        heading = max((line for line in held[0].lines if line[0] < 80), key=lambda line: line[2])
+        seen = []
+        original = compose.render
+
+        def _spy(shot, crop, *args, **kwargs):
+            seen.append(crop)
+            return original(shot, crop, *args, **kwargs)
+
+        compose.render = _spy
+        try:
+            list(frames_for(held, (640, 360), title="Maryland Men's Basketball", aspect="16:9"))
+        finally:
+            compose.render = original
+        self.assertTrue(seen)
+        _inside(self, heading, seen[-1])
+        self.assertLessEqual(seen[-1][0], heading[0] + 0.5)
+
+    def test_click_auto_zoom_keeps_the_left_heading(self):
+        from demo_director.director import END_FRAMES, _frame
+        data = example()
+        data["url"] = (ROOT / "fixtures" / "keyboard-kickoff.html").resolve().as_uri()
+        data["title"] = "Keyboard Kickoff"
+        data["steps"] = [{"action": "click", "selector": "#locker", "frames": 6}]
+        data["aspects"] = ["16:9"]
+        beats = record(parse(data))
+        self.assertEqual(beats[0].step.action, "click")
+        size = beats[0].before.size
+        heading = max(
+            (line for line in beats[0].lines if line[0] < 160 and line[2] > 180),
+            key=lambda line: line[2],
+        )
+        tight = compose.frame_rect(beats[0].box, size, 0.55, beats[0].label)
+        self.assertLess(heading[0], tight[0], (heading, tight))
+        crop = _frame(beats[0].box, size, 0.55, beats[0].label, beats[0].lines)
+        _inside(self, heading, crop)
+        _inside(self, beats[0].box, crop)
+        seen = []
+        original = compose.render
+
+        def _spy(shot, box, *args, **kwargs):
+            seen.append(box)
+            return original(shot, box, *args, **kwargs)
+
+        compose.render = _spy
+        try:
+            frames = list(frames_for(beats, (1280, 720), title="Keyboard Kickoff", aspect="16:9"))
+        finally:
+            compose.render = original
+        self.assertTrue(seen)
+        _inside(self, heading, seen[-1])
+        frames[-END_FRAMES - 1].save("/tmp/keyboard-kickoff-16x9.png")
+
     def test_recorded_label_is_left_of_the_add_button(self):
         data = example()
         data["steps"] = [{"action": "click", "selector": "#add", "frames": 2}]
@@ -166,6 +277,23 @@ class FramingTests(unittest.TestCase):
         _inside(self, label, crop)
         self.assertLessEqual(crop[0] + crop[2], beats[0].before.width + 0.5)
         self.assertLessEqual(crop[1] + crop[3], beats[0].before.height + 0.5)
+
+
+def _vertically(line, crop) -> bool:
+    return not (line[1] + line[3] < crop[1] or line[1] > crop[1] + crop[3])
+
+
+def _edge_ink(img: Image.Image, frac: float = 0.04) -> int:
+    band = max(2, int(img.width * frac))
+    count = 0
+    y0, y1 = img.height // 3, 2 * img.height // 3
+    xs = list(range(band)) + list(range(img.width - band, img.width))
+    for y in range(y0, y1):
+        for x in xs:
+            r, g, b = img.getpixel((x, y))
+            if r > 210 and g > 210 and b > 210:
+                count += 1
+    return count
 
 
 def _near_white(img: Image.Image) -> int:

@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tabs</title>
+<style>
+  body { margin: 0; padding: 28px; background: #111827; color: #e5e7eb; font-family: system-ui, sans-serif; }
+  button { margin: 0 8px 8px 0; padding: 10px 14px; font-size: 16px; }
+  nav button { background: #1f2937; color: white; border: 0; border-radius: 8px; }
+</style>
+</head>
+<body>
+  <h1>Roster board</h1>
+  <p>Synthetic roster for a Saturday session with orange cones ready today.</p>
+  <button id="close" type="button">Close</button>
+  <button id="later" type="button">Later</button>
+  <nav>
+    <button type="button">Box score</button>
+  </nav>
+  <script>
+    document.getElementById("close").onclick = () => {
+      document.getElementById("later").style.display = "none";
+    };
+  </script>
+</body>
+</html>

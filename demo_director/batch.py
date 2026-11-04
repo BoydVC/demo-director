@@ -10,10 +10,13 @@ import glob
 import json
 import os
 
+import pathlib
 from dataclasses import replace
 
 from .director import direct
 from .gallery import write_gallery
+from .guard import derive_names, load_deny_terms
+from .propose import readme_near
 from .session import RecordingFailure
 from .shotlist import ShotListError, load
 from .types import PiiPolicy
@@ -56,6 +59,16 @@ def status_for(rows: list[dict], failure: str | None = None) -> str:
     return "ok"
 
 
+def failure_summary(exc: RecordingFailure) -> str:
+    """Kind, step index, and selector. The status alone is not a report."""
+    parts = [f"{exc.kind} at step {exc.step_index}"]
+    if exc.selector:
+        parts.append(exc.selector)
+    if exc.detail and exc.detail not in {exc.kind, exc.selector, "no beat"}:
+        parts.append(exc.detail)
+    return " ".join(parts)
+
+
 def _slug(title: str) -> str:
     cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in title).strip("-")
     squashed = "-".join(part for part in cleaned.split("-") if part)
@@ -63,7 +76,8 @@ def _slug(title: str) -> str:
 
 
 def _render_one(path: str, outdir: str, scale: float, budget: int,
-                extra_names: tuple[str, ...] = ()) -> dict:
+                extra_names: tuple[str, ...] = (), allow_names: tuple[str, ...] = (),
+                derive: bool = False) -> dict:
     item: dict = {"shotlist": path, "status": "ok", "error": None, "aspects": {}}
     try:
         sl = load(path)
@@ -71,14 +85,24 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
         item["status"] = "error"
         item["error"] = str(exc)
         return item
-    if extra_names:
-        sl = replace(sl, pii=PiiPolicy(names=tuple(sl.pii.names) + tuple(extra_names)))
+    allow = {part.casefold() for part in allow_names}
+    deny = [term for term in tuple(sl.pii.names) + tuple(extra_names) + load_deny_terms()
+            if term.casefold() not in allow]
+    if derive:
+        derived = derive_names(readme_near(pathlib.Path(path).parent) + "\n" + sl.title, sl.title)
+        deny.extend(term for term in derived if term.casefold() not in allow and term not in deny)
+    sl = replace(sl, pii=PiiPolicy(names=tuple(deny), allow=tuple(allow_names)))
     item["title"] = sl.title
     try:
-        rendered = direct(sl, outdir, scale)
+        rendered = direct(sl, outdir, scale, budget)
     except RecordingFailure as exc:
         item["status"] = exc.kind
-        item["error"] = exc.detail or exc.kind
+        item["kind"] = exc.kind
+        item["step"] = exc.step_index
+        item["selector"] = exc.selector or None
+        if exc.warning:
+            item["warning"] = exc.warning
+        item["error"] = failure_summary(exc)
         return item
     rows = []
     for aspect in _ASPECT_ORDER:
@@ -86,8 +110,16 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
             continue
         info = rendered[aspect]
         row = aspect_record(
-            info["frames"], os.path.getsize(info["gif"]), sl.fps, budget, info["gif"], info["mp4"]
+            info["frames"],
+            os.path.getsize(info["gif"]),
+            int(info.get("fps", sl.fps)),
+            budget,
+            info["gif"],
+            info["mp4"],
         )
+        row["attempts"] = info.get("attempts", 1)
+        row["scale"] = info.get("scale", scale)
+        row["fps"] = info.get("fps", sl.fps)
         item["aspects"][aspect] = row
         rows.append(row)
     item["status"] = status_for(rows)
@@ -95,7 +127,8 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
 
 
 def batch(paths: list[str], outdir: str, scale: float = 0.6, budget: int = GIF_BUDGET,
-          extra_names: tuple[str, ...] = (), screenshot: bool = False) -> dict:
+          extra_names: tuple[str, ...] = (), screenshot: bool = False,
+          allow_names: tuple[str, ...] = (), derive_names: bool = False) -> dict:
     """Render every shot list. Report is deterministic for a given set of files.
 
     Frame counts come from the pure ``frames_for`` path. Byte sizes are measured
@@ -106,6 +139,7 @@ def batch(paths: list[str], outdir: str, scale: float = 0.6, budget: int = GIF_B
     os.makedirs(outdir, exist_ok=True)
     multi = len(files) > 1
     names = tuple(extra_names)
+    allowed = tuple(allow_names)
     items = []
     for path in files:
         if multi:
@@ -116,7 +150,7 @@ def batch(paths: list[str], outdir: str, scale: float = 0.6, budget: int = GIF_B
             dest = os.path.join(outdir, _slug(title))
         else:
             dest = outdir
-        items.append(_render_one(path, dest, scale, budget, names))
+        items.append(_render_one(path, dest, scale, budget, names, allowed, derive_names))
     report = {
         "ok": bool(items) and all(item.get("status") == "ok" for item in items),
         "budget_bytes": budget,

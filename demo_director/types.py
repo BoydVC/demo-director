@@ -7,6 +7,7 @@ recorded moment is a Beat; a finished render is a RenderReport.
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field
 from typing import Literal, Union
 
@@ -147,14 +148,102 @@ def step_text(step: Step) -> str | None:
 
 
 @dataclass(frozen=True)
+class BlankPolicy:
+    """When a styled page is still not a demo.
+
+    ``min_chars`` is the meaningful-character floor. ``patterns`` are
+    case-insensitive error and empty-state phrases. Defaults fail closed.
+    A shot list can replace either field with ``"blank": {"min_chars", "patterns"}``.
+    """
+
+    min_chars: int = 48
+    patterns: tuple[str, ...] = (
+        r"failed to load",
+        r"could(?: not|n't) load",
+        r"unavailable",
+        r"unreachable",
+        r"nothing is (?:shown|guessed)",
+        r"no calendar data",
+        r"not valid json",
+        r"\bno\b[\w\s,'-]{0,40}\bon air\b",
+        r"\bno\b[\w\s,'-]{0,40}\byet\b",
+        r"\berror\b",
+    )
+
+    def reason(self, text: str, prominent: str = "") -> str | None:
+        """Refuse when a phrase dominates, or the page has almost no copy.
+
+        A full page that merely mentions ``error`` or ``no scores yet`` is
+        fine. ``Failed to load data`` as the main copy is not. A phrase in a
+        heading or alert also refuses when little text sits outside that line.
+        """
+        if not isinstance(text, str):
+            return "no-visible-text"
+
+        def alnum(value: str) -> str:
+            return re.sub(r"[^0-9A-Za-z]", "", value or "")
+
+        meaningful = alnum(text)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()] or ([text.strip()] if text.strip() else [])
+
+        def matched(line: str):
+            for pattern in self.patterns:
+                found = re.search(pattern, line, re.IGNORECASE)
+                if found:
+                    return found
+            return None
+
+        error_lines = []
+        other_lines = []
+        snippet = ""
+        for line in lines:
+            found = matched(line)
+            # A line that leads with the phrase is the error. A sentence that
+            # only mentions it later still counts as page copy.
+            if found is None or found.start() > 24:
+                other_lines.append(line)
+                continue
+            error_lines.append(line)
+            if not snippet:
+                snippet = " ".join(found.group(0).split()).casefold()
+        if error_lines:
+            if len(lines) == 1:
+                found = matched(lines[0])
+                rest = len(alnum(lines[0])) - len(alnum(found.group(0) if found else ""))
+            else:
+                # Single-word chrome (a tab, a zero, a clock) is not the demo.
+                kept = [line for line in other_lines if len(alnum(line)) >= 16]
+                rest = len(alnum(" ".join(kept)))
+            outside = alnum(text)
+            if prominent:
+                outside = alnum(text.replace(prominent, "", 1))
+            in_prominent = bool(prominent) and matched(prominent) is not None and matched(prominent).start() <= 24
+            if rest < self.min_chars or (in_prominent and len(outside) < self.min_chars):
+                return f"error-phrase:{snippet}"
+        if len(meaningful) < self.min_chars:
+            return "sparse-text"
+        return None
+
+
+@dataclass(frozen=True)
 class PiiPolicy:
-    """Emails and phone numbers are always denied. ``names`` is the extra denylist."""
+    """Emails and phone numbers are always denied. ``names`` is the extra denylist.
+
+    ``allow`` is the list of derived possessives and 'for First Last' names
+    that batch and init should not block.
+    """
 
     names: tuple[str, ...] = ()
+    allow: tuple[str, ...] = ()
+    watch: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        names = tuple(part.strip() for part in self.names if isinstance(part, str) and part.strip())
-        object.__setattr__(self, "names", names)
+        def _clean(parts: tuple[str, ...]) -> tuple[str, ...]:
+            return tuple(part.strip() for part in parts if isinstance(part, str) and part.strip())
+
+        object.__setattr__(self, "names", _clean(self.names))
+        object.__setattr__(self, "allow", _clean(self.allow))
+        object.__setattr__(self, "watch", _clean(self.watch))
 
 
 @dataclass(frozen=True)
@@ -166,6 +255,7 @@ class ShotList:
     viewport: tuple[int, int] = (1280, 800)
     fps: int = 10
     pii: PiiPolicy = field(default_factory=PiiPolicy)
+    blank: BlankPolicy | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.title, str) or not self.title.strip():

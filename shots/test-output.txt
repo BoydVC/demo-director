@@ -1,2 +1,50 @@
+test_ease_endpoints (test_all.ComposeTests.test_ease_endpoints) ... ok
+test_fit_aspect_sizes (test_all.ComposeTests.test_fit_aspect_sizes) ... ok
+test_no_zoom_is_full (test_all.ComposeTests.test_no_zoom_is_full) ... ok
+test_zoom_stays_in_frame (test_all.ComposeTests.test_zoom_stays_in_frame) ... ok
+test_render_real_browser (test_all.EndToEnd.test_render_real_browser) ... /workspace/tests/test_all.py:48: ResourceWarning: unclosed file <_io.BufferedReader name='/tmp/tmp5t8y3069/demo-16x9.gif'>
+  g = Image.open(res[asp]["gif"])
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/workspace/tests/test_all.py:48: ResourceWarning: unclosed file <_io.BufferedReader name='/tmp/tmp5t8y3069/demo-1x1.gif'>
+  g = Image.open(res[asp]["gif"])
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.12/unittest/case.py:589: ResourceWarning: unclosed file <_io.BufferedReader name='/tmp/tmp5t8y3069/demo-9x16.gif'>
+  if method() is not None:
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_bad_aspect (test_all.ShotListTests.test_bad_aspect) ... ok
+test_example_parses (test_all.ShotListTests.test_example_parses) ... ok
+test_rejects (test_all.ShotListTests.test_rejects) ... ok
+test_clean_steps_capture_one_each (test_session.StatechartTests.test_clean_steps_capture_one_each) ... ok
+test_every_step_is_one_beat_or_a_typed_failure (test_session.StatechartTests.test_every_step_is_one_beat_or_a_typed_failure) ... ok
+test_illegal_edge_is_not_a_beat (test_session.StatechartTests.test_illegal_edge_is_not_a_beat) ... ok
+test_only_capture_adds_a_beat (test_session.StatechartTests.test_only_capture_adds_a_beat) ... ok
+test_pii_after_blocks_a_clean_start (test_session.StatechartTests.test_pii_after_blocks_a_clean_start) ... ok
+test_pii_blocks_capture_permanently (test_session.StatechartTests.test_pii_blocks_capture_permanently) ... ok
+test_batch_example_renders_three_aspects_under_budget (test_v1.BatchTests.test_batch_example_renders_three_aspects_under_budget) ... ok
+test_batch_pii_writes_no_gif (test_v1.BatchTests.test_batch_pii_writes_no_gif) ... ok
+test_frames_are_deterministic (test_v1.BatchTests.test_frames_are_deterministic) ... ok
+test_no_bypass_parameter (test_v1.BatchTests.test_no_bypass_parameter) ... ok
+test_paths_sort_and_budget_math (test_v1.BatchTests.test_paths_sort_and_budget_math) ... ok
+test_portrait_caption_stays_out_of_the_bottom_band (test_v1.FramingTests.test_portrait_caption_stays_out_of_the_bottom_band) ... ok
+test_recorded_label_is_left_of_the_add_button (test_v1.FramingTests.test_recorded_label_is_left_of_the_add_button) ... ok
+test_right_target_keeps_left_label (test_v1.FramingTests.test_right_target_keeps_left_label) ... ok
+test_zoom_rect_always_inside_and_covers_label (test_v1.FramingTests.test_zoom_rect_always_inside_and_covers_label) ... ok
+test_gallery_lists_every_aspect (test_v1.GalleryAndCITests.test_gallery_lists_every_aspect) ... ok
+test_workflow_renders_on_push_and_does_not_post (test_v1.GalleryAndCITests.test_workflow_renders_on_push_and_does_not_post) ... ok
+test_configured_name_blocks_the_render (test_v1.GuardTests.test_configured_name_blocks_the_render) ... ok
+test_deny_names_parse (test_v1.GuardTests.test_deny_names_parse) ... ok
+test_email_phone_and_configured_name (test_v1.GuardTests.test_email_phone_and_configured_name) ... ok
+test_fail_closed_on_unreadable_or_weak_name (test_v1.GuardTests.test_fail_closed_on_unreadable_or_weak_name) ... ok
+test_fixture_and_synthetic_copy_are_clean (test_v1.GuardTests.test_fixture_and_synthetic_copy_are_clean) ... ok
+test_missing_selector_is_typed (test_v1.GuardTests.test_missing_selector_is_typed) ... ok
+test_real_email_blocks_the_render (test_v1.GuardTests.test_real_email_blocks_the_render) ... ok
+test_page_proposes_visible_controls (test_v1.InitTests.test_page_proposes_visible_controls) ... ok
+test_pii_page_refuses_init (test_v1.InitTests.test_pii_page_refuses_init) ... ok
+test_readme_email_refuses (test_v1.InitTests.test_readme_email_refuses) ... ok
+test_readme_headings_become_captions (test_v1.InitTests.test_readme_headings_become_captions) ... ok
+
+----------------------------------------------------------------------
+Ran 36 tests in 27.632s
 
 OK

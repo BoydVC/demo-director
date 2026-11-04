@@ -28,6 +28,7 @@ class ShotList:
     aspects: tuple[str, ...] = ("16:9",)
     viewport: tuple[int, int] = (1280, 800)
     fps: int = 10
+    deny_names: tuple[str, ...] = ()
 
 
 def _step(i: int, raw: dict) -> Step:
@@ -57,9 +58,16 @@ def parse(data: dict) -> ShotList:
     if bad:
         raise ShotListError(f"unknown aspect {bad[0]}")
     vp = tuple(data.get("viewport", [1280, 800]))
+    if "deny_names" in data:
+        names = data["deny_names"]
+        if not isinstance(names, list) or any(not isinstance(n, str) for n in names):
+            raise ShotListError("deny_names must be a list of strings")
+    else:
+        names = []
     return ShotList(data["title"], data["url"],
                     tuple(_step(i, s) for i, s in enumerate(data["steps"])),
-                    aspects, (int(vp[0]), int(vp[1])), int(data.get("fps", 10)))
+                    aspects, (int(vp[0]), int(vp[1])), int(data.get("fps", 10)),
+                    tuple(names))
 
 
 def load(path: str) -> ShotList:

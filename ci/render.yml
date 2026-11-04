@@ -1,0 +1,22 @@
+# Demo Director — render on push and upload the artifacts.
+# Does not post anywhere. This file is the job definition; it is not installed
+# under .github/workflows. Copy it there only if a human wants the job.
+name: demo
+on:
+  push:
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pillow playwright && playwright install --with-deps chromium
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: python -m unittest discover -s tests
+      - run: python -m demo_director batch examples/ -o shots
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-renders
+          path: shots/

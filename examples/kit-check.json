@@ -1,0 +1,15 @@
+{
+  "title": "Kit Check",
+  "url": "../fixtures/kit-check.html",
+  "aspects": ["16:9", "1:1", "9:16"],
+  "fps": 10,
+  "steps": [
+    {"action": "caption", "text": "Check the kit before Saturday", "frames": 8},
+    {"action": "type", "selector": "#item", "text": "Mesh ball bag", "frames": 8},
+    {"action": "click", "selector": "#add", "frames": 6},
+    {"action": "caption", "text": "One tap marks the kit ready", "frames": 6},
+    {"action": "click", "selector": "#ready", "frames": 6},
+    {"action": "zoom", "selector": "#status", "frames": 8},
+    {"action": "hold", "frames": 10}
+  ]
+}

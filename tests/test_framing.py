@@ -228,6 +228,41 @@ class FramingTests(unittest.TestCase):
         _inside(self, heading, seen[-1])
         self.assertLessEqual(seen[-1][0], heading[0] + 0.5)
 
+    def test_click_auto_zoom_keeps_the_left_heading(self):
+        from demo_director.director import END_FRAMES, _frame
+        data = example()
+        data["url"] = (ROOT / "fixtures" / "keyboard-kickoff.html").resolve().as_uri()
+        data["title"] = "Keyboard Kickoff"
+        data["steps"] = [{"action": "click", "selector": "#locker", "frames": 6}]
+        data["aspects"] = ["16:9"]
+        beats = record(parse(data))
+        self.assertEqual(beats[0].step.action, "click")
+        size = beats[0].before.size
+        heading = max(
+            (line for line in beats[0].lines if line[0] < 160 and line[2] > 180),
+            key=lambda line: line[2],
+        )
+        tight = compose.frame_rect(beats[0].box, size, 0.55, beats[0].label)
+        self.assertLess(heading[0], tight[0], (heading, tight))
+        crop = _frame(beats[0].box, size, 0.55, beats[0].label, beats[0].lines)
+        _inside(self, heading, crop)
+        _inside(self, beats[0].box, crop)
+        seen = []
+        original = compose.render
+
+        def _spy(shot, box, *args, **kwargs):
+            seen.append(box)
+            return original(shot, box, *args, **kwargs)
+
+        compose.render = _spy
+        try:
+            frames = list(frames_for(beats, (1280, 720), title="Keyboard Kickoff", aspect="16:9"))
+        finally:
+            compose.render = original
+        self.assertTrue(seen)
+        _inside(self, heading, seen[-1])
+        frames[-END_FRAMES - 1].save("/tmp/keyboard-kickoff-16x9.png")
+
     def test_recorded_label_is_left_of_the_add_button(self):
         data = example()
         data["steps"] = [{"action": "click", "selector": "#add", "frames": 2}]

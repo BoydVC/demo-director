@@ -5,7 +5,9 @@ import sys
 import tempfile
 import unittest
 
-from demo_director.propose import Control, PageControls, draft_from, dump_draft, init_source, synthetic_value
+from demo_director.propose import (
+    Control, PageControls, display_title, draft_from, dump_draft, human_title, init_source, synthetic_value,
+)
 from demo_director.session import RecordingFailure
 from demo_director.shotlist import parse
 from demo_director.types import Caption, Click, Draft, Hold, Type, Zoom
@@ -128,6 +130,23 @@ class InitTests(unittest.TestCase):
         self.assertFalse(any("nth-of-type" in selector for selector in selectors))
         url = (ROOT / "fixtures" / "tabs.html").resolve().as_uri()
         record(replace(draft.shotlist, url=url))
+
+    def test_slug_becomes_a_spaced_title(self):
+        self.assertEqual(human_title("four-game-jam"), "Four Game Jam")
+        self.assertEqual(display_title("FOUR-GAMEJAM", "four-game-jam"), "Four Game Jam")
+        self.assertEqual(display_title("FOUR-GAME-JAM", ""), "Four Game Jam")
+        self.assertEqual(display_title("Weekend Planner", "demo-director"), "Weekend Planner")
+        folder = pathlib.Path(tempfile.mkdtemp()) / "four-game-jam"
+        folder.mkdir()
+        (folder / "index.html").write_text(
+            "<style>body{margin:0;padding:28px;background:#111;color:#eee;font-family:system-ui}</style>"
+            "<h1>FOUR-GAMEJAM</h1>"
+            "<p>Synthetic jam for a Saturday session with orange cones ready today.</p>"
+            "<button id=play>Play</button>"
+        )
+        draft = init_source(str(folder))
+        self.assertEqual(draft.shotlist.title, "Four Game Jam")
+        self.assertEqual(draft.shotlist.steps[0].text, "Four Game Jam")
 
     def test_reserved_email_in_a_readme_is_allowed(self):
         folder = pathlib.Path(tempfile.mkdtemp())

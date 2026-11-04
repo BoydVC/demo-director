@@ -37,6 +37,50 @@ _PHONE = re.compile(
 )
 
 
+# Given names implied by "Alex's" or "for Alex Example". Short tokens and
+# ordinary title words stay out so "Men's" and "Saturday session" do not block.
+_POSSESSIVE = re.compile(r"\b([A-Z][a-z]{3,})'s\b")
+_FOR_PERSON = re.compile(r"\bfor ([A-Z][a-z]{3,}) ([A-Z][a-z]{3,})\b")
+_NAME_STOP = frozenset({
+    "today", "tonight", "saturday", "sunday", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "weekend", "team", "demo", "user", "home", "game",
+    "board", "room", "click", "page", "error", "loading", "synthetic", "planner",
+    "check", "player", "locker", "keyboard", "practice", "session", "match",
+    "night", "stats", "item", "field", "time", "year", "week", "coach", "club",
+    "city", "park", "sample", "example", "test", "app", "data", "only",
+})
+
+
+def derived_names(text: str) -> tuple[str, ...]:
+    """Names a README or title gives away: a possessive, or 'for First Last'."""
+    if not isinstance(text, str) or not text:
+        return ()
+    found: list[str] = []
+
+    def add(name: str) -> None:
+        cleaned = " ".join(name.split())
+        if not cleaned or cleaned.casefold() in _NAME_STOP:
+            return
+        if cleaned not in found:
+            found.append(cleaned)
+
+    for match in _POSSESSIVE.finditer(text):
+        add(match.group(1))
+    for match in _FOR_PERSON.finditer(text):
+        first, last = match.group(1), match.group(2)
+        if first.casefold() in _NAME_STOP:
+            continue
+        add(f"{first} {last}")
+        add(first)
+    return tuple(found)
+
+
+def names_to_block(text: str, allow: Iterable[str] = ()) -> tuple[str, ...]:
+    """Derived names that are not on the allowlist. Empty means render may proceed."""
+    allowed = {part.casefold() for part in allow if isinstance(part, str)}
+    return tuple(name for name in derived_names(text) if name.casefold() not in allowed)
+
+
 def _reserved_email(address: str) -> bool:
     host = address.rsplit("@", 1)[-1]
     return _RESERVED_HOST.fullmatch(host) is not None

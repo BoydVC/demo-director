@@ -91,13 +91,15 @@ class RecordingFailure(Exception):
     failed, when the step had one.
     """
 
-    def __init__(self, kind: str, step_index: int = -1, detail: str = "", selector: str = ""):
+    def __init__(self, kind: str, step_index: int = -1, detail: str = "", selector: str = "",
+                 warning: str = ""):
         if kind not in FAILURE_KINDS:
             raise ValueError(f"untyped failure {kind!r}")
         self.kind = kind
         self.step_index = step_index
         self.detail = detail
         self.selector = selector or ""
+        self.warning = warning or ""
         msg = f"{kind} at step {step_index}"
         if self.selector:
             msg = f"{msg} ({self.selector})"

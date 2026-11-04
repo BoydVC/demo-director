@@ -10,10 +10,13 @@ import glob
 import json
 import os
 
+import pathlib
 from dataclasses import replace
 
 from .director import direct
 from .gallery import write_gallery
+from .guard import names_to_block
+from .propose import readme_near
 from .session import RecordingFailure
 from .shotlist import ShotListError, load
 from .types import PiiPolicy
@@ -73,7 +76,7 @@ def _slug(title: str) -> str:
 
 
 def _render_one(path: str, outdir: str, scale: float, budget: int,
-                extra_names: tuple[str, ...] = ()) -> dict:
+                extra_names: tuple[str, ...] = (), allow_names: tuple[str, ...] = ()) -> dict:
     item: dict = {"shotlist": path, "status": "ok", "error": None, "aspects": {}}
     try:
         sl = load(path)
@@ -81,9 +84,19 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
         item["status"] = "error"
         item["error"] = str(exc)
         return item
-    if extra_names:
-        sl = replace(sl, pii=PiiPolicy(names=tuple(sl.pii.names) + tuple(extra_names)))
+    allow = tuple(allow_names)
+    sl = replace(sl, pii=PiiPolicy(names=tuple(sl.pii.names) + tuple(extra_names), allow=tuple(sl.pii.allow) + allow))
     item["title"] = sl.title
+    derived = names_to_block(readme_near(pathlib.Path(path).parent) + "\n" + sl.title, allow)
+    if derived:
+        exc = RecordingFailure("pii-blocked", -1, "name", warning="derived-name: " + ", ".join(derived))
+        item["status"] = exc.kind
+        item["kind"] = exc.kind
+        item["step"] = exc.step_index
+        item["selector"] = None
+        item["warning"] = exc.warning
+        item["error"] = failure_summary(exc)
+        return item
     try:
         rendered = direct(sl, outdir, scale, budget)
     except RecordingFailure as exc:
@@ -91,6 +104,8 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
         item["kind"] = exc.kind
         item["step"] = exc.step_index
         item["selector"] = exc.selector or None
+        if exc.warning:
+            item["warning"] = exc.warning
         item["error"] = failure_summary(exc)
         return item
     rows = []
@@ -116,7 +131,8 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
 
 
 def batch(paths: list[str], outdir: str, scale: float = 0.6, budget: int = GIF_BUDGET,
-          extra_names: tuple[str, ...] = (), screenshot: bool = False) -> dict:
+          extra_names: tuple[str, ...] = (), screenshot: bool = False,
+          allow_names: tuple[str, ...] = ()) -> dict:
     """Render every shot list. Report is deterministic for a given set of files.
 
     Frame counts come from the pure ``frames_for`` path. Byte sizes are measured
@@ -127,6 +143,7 @@ def batch(paths: list[str], outdir: str, scale: float = 0.6, budget: int = GIF_B
     os.makedirs(outdir, exist_ok=True)
     multi = len(files) > 1
     names = tuple(extra_names)
+    allowed = tuple(allow_names)
     items = []
     for path in files:
         if multi:
@@ -137,7 +154,7 @@ def batch(paths: list[str], outdir: str, scale: float = 0.6, budget: int = GIF_B
             dest = os.path.join(outdir, _slug(title))
         else:
             dest = outdir
-        items.append(_render_one(path, dest, scale, budget, names))
+        items.append(_render_one(path, dest, scale, budget, names, allowed))
     report = {
         "ok": bool(items) and all(item.get("status") == "ok" for item in items),
         "budget_bytes": budget,

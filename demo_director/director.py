@@ -13,17 +13,16 @@ import os
 import shutil
 import subprocess
 import tempfile
-import warnings
 from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image
 
 from . import compose
-from .guard import hits
+from .guard import hits, names_to_block
 from .session import Phase, RecordingFailure, Session, StepSignals, run_step
 from .shotlist import ASPECTS, FIXTURE_URL
-from .types import Beat, Box, ShotList, step_selector, step_text
+from .types import Beat, BlankPolicy, Box, ShotList, step_selector, step_text
 
 TITLE_FRAMES = 12
 END_FRAMES = 12
@@ -139,6 +138,46 @@ _LABEL_JS = """
     label: union(union(labelFor(el), rowBox(el)), neighborBox(el)),
     lines: collectLines()
   };
+}
+"""
+
+_LINES_JS = """
+() => {
+  const rectOf = (r) => ({x: r.x, y: r.y, w: r.width, h: r.height});
+  function ink(node) {
+    const tag = node.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") {
+      return rectOf(node.getBoundingClientRect());
+    }
+    const text = (node.innerText || "").trim();
+    if (!text) return rectOf(node.getBoundingClientRect());
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const rects = [...range.getClientRects()].filter((r) => r.width > 0.5 && r.height > 0.5);
+    if (!rects.length) return rectOf(node.getBoundingClientRect());
+    const x0 = Math.min(...rects.map((r) => r.x));
+    const y0 = Math.min(...rects.map((r) => r.y));
+    const x1 = Math.max(...rects.map((r) => r.right));
+    const y1 = Math.max(...rects.map((r) => r.bottom));
+    return {x: x0, y: y0, w: x1 - x0, h: y1 - y0};
+  }
+  const out = [];
+  const push = (box) => {
+    if (!box || box.w < 8 || box.h < 8 || box.h > 180) return;
+    out.push(box);
+  };
+  document.querySelectorAll("h1,h2,h3,h4,header,button,.card,.sub,.hero,.kick,.brand,#conf,#status,.tag,label,p,[role=heading]").forEach((node) => {
+    push(ink(node));
+  });
+  document.querySelectorAll("div,span,li,strong,a").forEach((node) => {
+    if (node.childElementCount > 2) return;
+    const box = ink(node);
+    if (!box || box.x > 120) return;
+    const text = (node.innerText || "").trim();
+    if (text.length < 4 || text.length > 90) return;
+    push(box);
+  });
+  return out;
 }
 """
 
@@ -274,12 +313,16 @@ _PAGE_STATE_JS = """
 """
 
 
-def page_problem(page, response) -> str | None:
-    """Blank, unstyled, or HTTP error. None when the page is demoable.
+def page_problem(page, response, policy: BlankPolicy | None = None) -> str | None:
+    """Blank, unstyled, sparse, or an error page. None when the page is demoable.
 
     A style tag with no rules (an unfilled ``/*__CSS__*/`` template) counts
-    as unstyled. ``file:`` loads report status 0 or 200 and are not errors.
+    as unstyled. A styled page with almost no copy, or with an error or
+    empty-state phrase, fails closed too. ``file:`` loads report status 0 or
+    200 and are not HTTP errors. ``policy`` replaces the default phrases and
+    the character floor.
     """
+    rules = policy or BlankPolicy()
     status = getattr(response, "status", None) if response is not None else None
     if isinstance(status, int) and status >= 400:
         return f"http-{status}"
@@ -294,16 +337,24 @@ def page_problem(page, response) -> str | None:
         return "unstyled"
     if not text.strip():
         return "no-visible-text"
-    return None
+    return rules.reason(text)
 
 
-def refuse_unusable(page, response, step_index: int = -1) -> None:
-    """Warn and fail the take when the page is blank, unstyled, or an error."""
-    problem = page_problem(page, response)
+def refuse_unusable(page, response, step_index: int = -1, policy: BlankPolicy | None = None) -> None:
+    """Fail the take when the page is blank, unstyled, sparse, or an error page.
+
+    The reason is on the exception. Callers put it in the JSON status. Nothing
+    is written to stderr here.
+    """
+    problem = page_problem(page, response, policy)
     if not problem:
         return
-    warnings.warn(f"page is not demoable: {problem}", RuntimeWarning, stacklevel=2)
-    raise RecordingFailure("blank-page", step_index, problem)
+    raise RecordingFailure(
+        "blank-page",
+        step_index,
+        problem,
+        warning=f"page is not demoable: {problem}",
+    )
 
 
 def _probe(page, selector: str, timeout_ms: int = 3000):
@@ -340,17 +391,29 @@ def _probe(page, selector: str, timeout_ms: int = 3000):
     return True, box, label, lines, None
 
 
-def _perform(page, step) -> None:
+def _collect_lines(page) -> tuple[Box, ...]:
+    """Text boxes on the page as it is now, after a click has changed it."""
+    try:
+        raw = page.evaluate(_LINES_JS)
+    except Exception:
+        return ()
+    if not isinstance(raw, list):
+        return ()
+    return tuple(item for item in (_box(row) for row in raw) if item)
+
+
+def _perform(page, step, policy: BlankPolicy | None = None) -> None:
     if step.action == "goto":
         response = page.goto(step.url, timeout=15000)
-        refuse_unusable(page, response)
+        refuse_unusable(page, response, policy=policy)
     elif step.action == "click":
         page.click(step.selector, timeout=5000)
     elif step.action == "type":
         page.fill(step.selector, step.text or "", timeout=5000)
 
 
-def _drive_step(page, session: Session, step, names: tuple[str, ...]) -> tuple[Session, Beat | None]:
+def _drive_step(page, session: Session, step, names: tuple[str, ...],
+                policy: BlankPolicy | None = None) -> tuple[Session, Beat | None]:
     """One chart step. A beat is returned only when ``run_step`` captures."""
     needs = step.action in {"click", "type", "zoom"}
     text = _page_text(page)
@@ -372,7 +435,7 @@ def _drive_step(page, session: Session, step, names: tuple[str, ...]) -> tuple[S
         return failed, None
 
     try:
-        _perform(page, step)
+        _perform(page, step, policy)
     except RecordingFailure:
         raise
     except Exception as exc:
@@ -406,6 +469,12 @@ def _drive_step(page, session: Session, step, names: tuple[str, ...]) -> tuple[S
     except Exception:
         failed = run_step(session, StepSignals(needs, found, "settling", pii, pii_after))
         return failed, None
+    # The click auto-zoom is framed from this beat. Lines probed before the
+    # click miss a heading the click just revealed, so the crop slices it.
+    if step.action in {"click", "zoom"}:
+        fresh = _collect_lines(page)
+        if fresh:
+            lines = fresh
     return final, Beat(before, after, box, step, label, lines)
 
 
@@ -432,14 +501,21 @@ def record(sl: ShotList) -> list[Beat]:
                 kind = classify_failure(exc, navigating=True)
                 raise RecordingFailure(kind, -1, "navigation") from exc
             opening = _page_text(page)
+            derived = names_to_block(sl.title + "\n" + (opening or ""), sl.pii.allow)
+            if derived:
+                raise RecordingFailure(
+                    "pii-blocked", -1, "name",
+                    warning="derived-name: " + ", ".join(derived),
+                )
             opening_hits = hits(opening, names)
             if opening_hits:
                 blocked = run_step(session, StepSignals(False, True, None, True, False))
                 raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(opening_hits))
-            refuse_unusable(page, response)
+            policy = sl.blank or BlankPolicy()
+            refuse_unusable(page, response, policy=policy)
             for index, step in enumerate(sl.steps):
                 try:
-                    session, beat = _drive_step(page, session, step, names)
+                    session, beat = _drive_step(page, session, step, names, policy)
                 except RecordingFailure as exc:
                     selector = exc.selector or step_selector(step) or ""
                     raise RecordingFailure(exc.kind, index, exc.detail, selector) from exc
@@ -477,12 +553,14 @@ def _frame(box, size, amount, label, lines=()):
     crop = compose.frame_rect(box, size, amount, focus)
     must = tuple(item for item in (box, focus) if item)
     if lines:
+        opened = crop
         crop = compose.contain_left_text(crop, tuple(lines), must, size)
-        # Lines the widen step just pulled in have to stay put. unsliced may
-        # slide off some other sliced row, but not back through the heading.
+        # Anything the widen step pulled in, including a heading the click
+        # just showed, has to stay inside. unsliced may still slide off some
+        # other row.
         kept = tuple(
             line for line in lines
-            if compose._inside(line, crop) and line[0] <= size[0] * 0.12
+            if compose._inside(line, crop) and line[0] < opened[0] - 0.25
         )
         crop = compose.unsliced(crop, tuple(lines), must + kept, size)
     return crop

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlparse
 
-from .guard import hits
+from .guard import hits, names_to_block
 from .session import RecordingFailure
 from .shotlist import FIXTURE_URL, dump
 from .types import (
@@ -155,6 +155,81 @@ def headings_in(text: str) -> tuple[str, ...]:
     return tuple(found[:6])
 
 
+def human_title(slug: str) -> str:
+    """``four-game-jam`` and ``FOUR-GAME-JAM`` become ``Four Game Jam``."""
+    parts = [part for part in re.split(r"[-_\s]+", (slug or "").strip()) if part]
+    return " ".join(part[:1].upper() + part[1:].lower() for part in parts)
+
+
+def _letters(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").casefold())
+
+
+def display_title(page_title: str, slug: str = "") -> str:
+    """Prefer a spaced title over a repo slug or a jammed all-caps heading.
+
+    ``FOUR-GAMEJAM`` from the folder ``four-game-jam`` is ``Four Game Jam``.
+    A real heading such as ``Weekend Planner`` is left as written.
+    """
+    raw = " ".join((page_title or "").split())
+    pretty = human_title(slug) if slug else ""
+    if not raw:
+        return pretty or "Demo"
+    slug_like = bool(re.fullmatch(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+", raw))
+    same = bool(pretty) and _letters(raw) == _letters(slug)
+    if same and pretty:
+        return pretty
+    if slug_like:
+        return human_title(raw)
+    return raw
+
+
+def repo_slug(path: pathlib.Path) -> str:
+    """Directory name the page belongs to, skipping generic folders like ``web``."""
+    generic = {"web", "public", "dist", "src", "fixtures", "demo", "app", "www", "static"}
+    start = path if path.is_dir() else path.parent
+    current = start
+    for _ in range(6):
+        name = current.name
+        if name and name.lower() not in generic and ("-" in name or "_" in name):
+            return name
+        if current.parent == current:
+            break
+        current = current.parent
+    if path.is_file() and path.stem.lower() not in generic:
+        return path.stem
+    return start.name
+
+
+def readme_near(start: pathlib.Path) -> str:
+    """README text walking up from ``start``, or empty when there is none."""
+    current = start if start.is_dir() else start.parent
+    for _ in range(8):
+        for name in ("README.md", "Readme.md", "readme.md"):
+            candidate = current / name
+            if candidate.is_file():
+                try:
+                    return candidate.read_text()
+                except OSError:
+                    return ""
+        if current.parent == current:
+            break
+        current = current.parent
+    return ""
+
+
+def _block_derived(chunks: list[str], allow: tuple[str, ...] = ()) -> None:
+    blocked = names_to_block("\n".join(chunks), allow)
+    if not blocked:
+        return
+    raise RecordingFailure(
+        "pii-blocked",
+        -1,
+        "name",
+        warning="derived-name: " + ", ".join(blocked),
+    )
+
+
 def public_text(text: str, fallback: str) -> str:
     cleaned = " ".join((text or "").split())
     if not cleaned or hits(cleaned):
@@ -261,8 +336,7 @@ def draft_from(title: str, url: str, headings: tuple[str, ...] | list[str],
     captions = [public_text(heading, "") for heading in headings]
     captions = [caption for caption in captions if caption]
     if not captions:
-        fallback = page.title if page is not None else title
-        captions = [public_text(fallback, "Demo")]
+        captions = [public_text(title or (page.title if page is not None else ""), "Demo")]
     for index, caption in enumerate(captions):
         kind = "heading" if headings else "title"
         add(Caption(caption, frames=8 if index == 0 else 6), kind, caption)
@@ -384,13 +458,18 @@ def probe(url: str) -> tuple[PageControls, tuple[str, ...], str]:
             browser.close()
 
 
-def from_page(url: str, fallback: str = "Demo") -> Draft:
+def from_page(url: str, fallback: str = "Demo", slug: str = "",
+              allow_names: tuple[str, ...] = ()) -> Draft:
     page, results, text = probe(url)
     _refuse(text)
-    return draft_from(page.title or fallback, _portable(url), (), page, results)
+    local = pathlib.Path(urlparse(url).path) if url.startswith("file:") else None
+    readme = readme_near(local) if local is not None else ""
+    chosen = display_title(page.title or fallback, slug or fallback)
+    _block_derived([readme, page.title, text, chosen], allow_names)
+    return draft_from(chosen, _portable(url), (), page, results)
 
 
-def from_readme(path: pathlib.Path) -> Draft:
+def from_readme(path: pathlib.Path, slug: str = "", allow_names: tuple[str, ...] = ()) -> Draft:
     text = path.read_text()
     _refuse(text)
     headings = headings_in(text)
@@ -401,19 +480,25 @@ def from_readme(path: pathlib.Path) -> Draft:
     if url is None:
         if not headings:
             raise ShotListError(f"no headings in {path}")
-        return draft_from(headings[0], FIXTURE_URL, headings, None)
+        title = display_title(headings[0], slug)
+        _block_derived([text, title], allow_names)
+        return draft_from(title, FIXTURE_URL, (title, *headings[1:]), None)
     page, results, page_text = probe(url)
     _refuse(page_text)
-    title = headings[0] if headings else page.title
-    return draft_from(title, _portable(url), headings, page, results)
+    raw = headings[0] if headings else page.title
+    title = display_title(raw, slug or path.parent.name)
+    _block_derived([text, page.title, page_text, title], allow_names)
+    shown = (title, *headings[1:]) if headings else ()
+    return draft_from(title, _portable(url), shown, page, results)
 
 
-def init_source(source: str) -> Draft:
+def init_source(source: str, allow_names: tuple[str, ...] = ()) -> Draft:
+    allow = tuple(allow_names)
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", source):
-        return from_page(source, "Demo")
+        return from_page(source, "Demo", allow_names=allow)
     path = pathlib.Path(source)
     if path.is_file() and (path.suffix.lower() in {".md", ".markdown"} or path.name.lower().startswith("readme")):
-        return from_readme(path)
+        return from_readme(path, slug=repo_slug(path.parent), allow_names=allow)
     if path.is_dir():
         readme = None
         for name in ("README.md", "Readme.md", "readme.md"):
@@ -421,12 +506,14 @@ def init_source(source: str) -> Draft:
             if candidate.is_file():
                 readme = candidate
                 break
+        slug = repo_slug(path)
         if readme is not None:
-            return from_readme(readme)
+            return from_readme(readme, slug=slug, allow_names=allow)
         html = _find_html(path)
         if html is None:
             raise ShotListError(f"no HTML fixture under {path}")
-        return from_page(html.resolve().as_uri(), path.name)
+        return from_page(html.resolve().as_uri(), slug, slug=slug, allow_names=allow)
     if path.is_file():
-        return from_page(path.resolve().as_uri(), path.stem.replace("-", " ").replace("_", " ").title())
+        slug = repo_slug(path)
+        return from_page(path.resolve().as_uri(), slug, slug=slug, allow_names=allow)
     raise ShotListError(f"init source not found: {source}")

@@ -7,6 +7,7 @@ recorded moment is a Beat; a finished render is a RenderReport.
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field
 from typing import Literal, Union
 
@@ -147,14 +148,55 @@ def step_text(step: Step) -> str | None:
 
 
 @dataclass(frozen=True)
+class BlankPolicy:
+    """When a styled page is still not a demo.
+
+    ``min_chars`` is the meaningful-character floor. ``patterns`` are
+    case-insensitive error and empty-state phrases. Defaults fail closed.
+    A shot list can replace either field with ``"blank": {"min_chars", "patterns"}``.
+    """
+
+    min_chars: int = 48
+    patterns: tuple[str, ...] = (
+        r"failed to load",
+        r"could(?: not|n't) load",
+        r"unavailable",
+        r"\bno\b[\w\s,'-]{0,40}\bon air\b",
+        r"\bno\b[\w\s,'-]{0,40}\byet\b",
+        r"\berror\b",
+    )
+
+    def reason(self, text: str) -> str | None:
+        """A stable detail string, or None when the copy is enough and clean."""
+        if not isinstance(text, str):
+            return "no-visible-text"
+        for pattern in self.patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                snippet = " ".join(match.group(0).split()).casefold()
+                return f"error-phrase:{snippet}"
+        meaningful = re.sub(r"[^0-9A-Za-z]", "", text)
+        if len(meaningful) < self.min_chars:
+            return "sparse-text"
+        return None
+
+
+@dataclass(frozen=True)
 class PiiPolicy:
-    """Emails and phone numbers are always denied. ``names`` is the extra denylist."""
+    """Emails and phone numbers are always denied. ``names`` is the extra denylist.
+
+    ``allow`` is the list of derived possessives and 'for First Last' names
+    that batch and init should not block.
+    """
 
     names: tuple[str, ...] = ()
+    allow: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         names = tuple(part.strip() for part in self.names if isinstance(part, str) and part.strip())
+        allow = tuple(part.strip() for part in self.allow if isinstance(part, str) and part.strip())
         object.__setattr__(self, "names", names)
+        object.__setattr__(self, "allow", allow)
 
 
 @dataclass(frozen=True)
@@ -166,6 +208,7 @@ class ShotList:
     viewport: tuple[int, int] = (1280, 800)
     fps: int = 10
     pii: PiiPolicy = field(default_factory=PiiPolicy)
+    blank: BlankPolicy | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.title, str) or not self.title.strip():

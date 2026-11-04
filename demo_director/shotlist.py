@@ -8,6 +8,7 @@ import re
 from .types import (
     ASPECTS,
     Aspect,
+    BlankPolicy,
     Caption,
     Click,
     Goto,
@@ -74,6 +75,30 @@ def _names(data: dict) -> PiiPolicy:
     return PiiPolicy(names=tuple(seen))
 
 
+def _blank(data: dict) -> BlankPolicy | None:
+    """Missing key means the built-in fail-closed policy. An object replaces it."""
+    if "blank" not in data or data["blank"] is None:
+        return None
+    raw = data["blank"]
+    if not isinstance(raw, dict):
+        raise ShotListError("blank must be an object")
+    patterns = raw.get("patterns", BlankPolicy().patterns)
+    if not isinstance(patterns, list) or not all(isinstance(item, str) for item in patterns):
+        raise ShotListError("blank.patterns must be a list of strings")
+    try:
+        min_chars = int(raw.get("min_chars", BlankPolicy.min_chars))
+    except (TypeError, ValueError):
+        raise ShotListError("blank.min_chars must be an integer") from None
+    if min_chars < 0:
+        raise ShotListError("blank.min_chars must be an integer")
+    for pattern in patterns:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ShotListError(f"blank.patterns: {exc}") from exc
+    return BlankPolicy(min_chars, tuple(patterns))
+
+
 def parse(data: dict) -> ShotList:
     if not isinstance(data, dict):
         raise ShotListError("shot list must be an object")
@@ -106,6 +131,7 @@ def parse(data: dict) -> ShotList:
         (width, height),
         fps,
         _names(data),
+        _blank(data),
     )
 
 
@@ -131,6 +157,11 @@ def dump(shotlist: ShotList) -> dict:
     if shotlist.pii.names:
         data["pii"] = {"names": list(shotlist.pii.names)}
         data["deny_names"] = list(shotlist.pii.names)
+    if shotlist.blank is not None:
+        data["blank"] = {
+            "min_chars": shotlist.blank.min_chars,
+            "patterns": list(shotlist.blank.patterns),
+        }
     return data
 
 

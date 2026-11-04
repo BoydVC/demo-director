@@ -138,7 +138,9 @@ class GuardTests(unittest.TestCase):
         page = folder / "salon.html"
         page.write_text(
             "<style>body{font-family:system-ui;background:#102;color:#eee;padding:24px}</style>"
-            "<h1>Salon desk</h1><p>Booked as desk.demo@example.com</p>"
+            "<h1>Salon desk</h1>"
+            "<p>Synthetic schedule for a Saturday session with orange cones ready today.</p>"
+            "<p>Booked as desk.demo@example.com</p>"
         )
         data = example()
         data["url"] = page.resolve().as_uri()
@@ -171,21 +173,22 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(classify_failure(TimeoutError("Timeout 15000ms exceeded"), navigating=True), "timeout")
 
         folder = pathlib.Path(tempfile.mkdtemp())
+        filler = "<p>Synthetic demo board for a Saturday session with orange cones ready today.</p>"
         hidden = folder / "hidden.html"
         hidden.write_text(
             "<style>body{background:#111;color:#fff;font-family:sans-serif}</style>"
-            "<p>Visible copy</p><button id=go hidden>Go</button>"
+            + filler + "<p>Visible copy</p><button id=go hidden>Go</button>"
         )
         bad = folder / "date.html"
         bad.write_text(
             "<style>body{background:#111;color:#fff;font-family:sans-serif}</style>"
-            "<p>When</p><input id=d type=date>"
+            + filler + "<p>When</p><input id=d type=date>"
         )
         covered_page = folder / "covered.html"
         covered_page.write_text(
             "<style>body{background:#111;color:#fff;font-family:sans-serif}"
-            "#c{position:fixed;inset:0}</style><p>Visible copy</p>"
-            "<button id=go>Go</button><div id=c></div>"
+            "#c{position:fixed;inset:0}</style>" + filler +
+            "<p>Visible copy</p><button id=go>Go</button><div id=c></div>"
         )
         cases = (
             (hidden, [{"action": "click", "selector": "#go", "frames": 2}], "not-visible", "#go"),
@@ -225,11 +228,11 @@ class GuardTests(unittest.TestCase):
             data["url"] = page.resolve().as_uri()
             data["steps"] = [{"action": "hold", "frames": 2}]
             out = tempfile.mkdtemp()
-            with self.assertWarns(RuntimeWarning):
-                with self.assertRaises(RecordingFailure) as ctx:
-                    direct(parse(data), out, scale=0.3)
+            with self.assertRaises(RecordingFailure) as ctx:
+                direct(parse(data), out, scale=0.3)
             self.assertEqual(ctx.exception.kind, "blank-page", page.name)
             self.assertEqual(ctx.exception.detail, detail)
+            self.assertTrue(ctx.exception.warning.startswith("page is not demoable:"))
             self.assertEqual(list(pathlib.Path(out).glob("demo-*.gif")), [])
 
         class Handler(BaseHTTPRequestHandler):
@@ -251,11 +254,11 @@ class GuardTests(unittest.TestCase):
             data = example()
             data["url"] = f"http://127.0.0.1:{server.server_address[1]}/missing"
             data["steps"] = [{"action": "hold", "frames": 2}]
-            with self.assertWarns(RuntimeWarning):
-                with self.assertRaises(RecordingFailure) as ctx:
-                    direct(parse(data), tempfile.mkdtemp(), scale=0.3)
+            with self.assertRaises(RecordingFailure) as ctx:
+                direct(parse(data), tempfile.mkdtemp(), scale=0.3)
             self.assertEqual(ctx.exception.kind, "blank-page")
             self.assertIn("http-404", ctx.exception.detail)
+            self.assertIn("http-404", ctx.exception.warning)
         finally:
             server.shutdown()
             server.server_close()
@@ -276,6 +279,85 @@ class GuardTests(unittest.TestCase):
         self.assertIn("step 0", item["error"])
         self.assertIn("#no-such-control", item["error"])
         self.assertIn("selector-missing", item["error"])
+
+    def test_styled_empty_and_error_pages_fail_closed(self):
+        import subprocess
+        import sys
+        cases = (
+            ("fixtures/blank-sparse.html", "sparse-text"),
+            ("fixtures/blank-failed.html", "error-phrase:failed to load"),
+            ("fixtures/blank-unavailable.html", "error-phrase:unavailable"),
+            ("fixtures/blank-on-air.html", "error-phrase:no episodes on air"),
+            ("fixtures/blank-error.html", "error-phrase:error"),
+        )
+        for rel, detail in cases:
+            data = example()
+            data["url"] = (ROOT / rel).resolve().as_uri()
+            data["steps"] = [{"action": "hold", "frames": 2}]
+            data["aspects"] = ["16:9"]
+            out = tempfile.mkdtemp()
+            with self.assertRaises(RecordingFailure) as ctx:
+                direct(parse(data), out, scale=0.3)
+            self.assertEqual(ctx.exception.kind, "blank-page", rel)
+            self.assertEqual(ctx.exception.detail, detail, rel)
+            self.assertIn(detail, ctx.exception.warning)
+            self.assertEqual(list(pathlib.Path(out).glob("demo-*.gif")), [])
+        proc = subprocess.run(
+            [sys.executable, "-m", "demo_director", "init", str(ROOT / "fixtures" / "blank-failed.html")],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(proc.returncode, 1)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["status"], "blank-page")
+        self.assertEqual(payload["detail"], "error-phrase:failed to load")
+        self.assertIn("warning", payload)
+        self.assertNotIn("RuntimeWarning", proc.stdout)
+
+    def test_blank_policy_is_configurable(self):
+        from demo_director.types import BlankPolicy
+        page = "Synthetic schedule for a Saturday session with orange cones ready today."
+        self.assertIsNone(BlankPolicy().reason(page))
+        self.assertEqual(BlankPolicy(min_chars=500).reason(page), "sparse-text")
+        self.assertEqual(
+            BlankPolicy(patterns=(r"orange cones",)).reason(page),
+            "error-phrase:orange cones",
+        )
+        data = example()
+        data["url"] = (ROOT / "fixtures" / "blank-sparse.html").resolve().as_uri()
+        data["steps"] = [{"action": "hold", "frames": 2}]
+        data["aspects"] = ["16:9"]
+        data["blank"] = {"min_chars": 1, "patterns": []}
+        out = tempfile.mkdtemp()
+        direct(parse(data), out, scale=0.3)
+        self.assertTrue(list(pathlib.Path(out).glob("demo-*.gif")))
+
+    def test_derived_names_block_unless_allowlisted(self):
+        from demo_director.guard import derived_names, names_to_block
+        self.assertEqual(derived_names("Maryland Men's Basketball"), ())
+        self.assertEqual(derived_names("for a Saturday session"), ())
+        self.assertEqual(derived_names("Alex's Chair"), ("Alex",))
+        self.assertEqual(derived_names("Built for Alex Example."), ("Alex Example", "Alex"))
+        self.assertEqual(names_to_block("Alex's Chair", ("Alex",)), ())
+        folder = pathlib.Path(tempfile.mkdtemp())
+        data = example()
+        data["title"] = "Alex's Chair"
+        data["url"] = (ROOT / "fixtures" / "named-chair.html").resolve().as_uri()
+        data["steps"] = [{"action": "hold", "frames": 2}]
+        data["aspects"] = ["16:9"]
+        path = folder / "chair.json"
+        path.write_text(json.dumps(data))
+        (folder / "README.md").write_text("# Desk\n\nSynthetic board for Alex Example.\n")
+        out = pathlib.Path(tempfile.mkdtemp())
+        blocked = batch([str(path)], str(out), scale=0.3)
+        item = blocked["items"][0]
+        self.assertEqual(item["status"], "pii-blocked")
+        self.assertTrue(item["error"].endswith("name"))
+        self.assertIn("Alex", item["warning"])
+        self.assertNotIn("Miranda", item["warning"])
+        self.assertEqual(list(out.glob("demo-*.gif")), [])
+        allowed = batch([str(path)], tempfile.mkdtemp(), scale=0.3, allow_names=("Alex", "Alex Example"))
+        self.assertEqual(allowed["items"][0]["status"], "ok", allowed)
 
 
 if __name__ == "__main__":

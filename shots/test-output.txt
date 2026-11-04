@@ -1,2 +1,4 @@
+python -m unittest discover -s tests
+Ran 24 tests in 22.897s
 
 OK

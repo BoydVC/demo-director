@@ -1,7 +1,10 @@
 """Shot list model. A shot list is the single source of truth for a demo."""
 from __future__ import annotations
+
 import json
-from dataclasses import dataclass, field
+import pathlib
+import re
+from dataclasses import dataclass
 
 ACTIONS = {"goto", "click", "type", "caption", "hold", "zoom"}
 ASPECTS = {"16:9": (1280, 720), "1:1": (1080, 1080), "9:16": (720, 1280)}
@@ -28,6 +31,7 @@ class ShotList:
     aspects: tuple[str, ...] = ("16:9",)
     viewport: tuple[int, int] = (1280, 800)
     fps: int = 10
+    deny_names: tuple[str, ...] = ()
 
 
 def _step(i: int, raw: dict) -> Step:
@@ -57,11 +61,17 @@ def parse(data: dict) -> ShotList:
     if bad:
         raise ShotListError(f"unknown aspect {bad[0]}")
     vp = tuple(data.get("viewport", [1280, 800]))
+    names = tuple(str(n) for n in data.get("deny_names", ()))
     return ShotList(data["title"], data["url"],
                     tuple(_step(i, s) for i, s in enumerate(data["steps"])),
-                    aspects, (int(vp[0]), int(vp[1])), int(data.get("fps", 10)))
+                    aspects, (int(vp[0]), int(vp[1])), int(data.get("fps", 10)), names)
 
 
 def load(path: str) -> ShotList:
     with open(path) as f:
-        return parse(json.load(f))
+        data = json.load(f)
+    url = data.get("url") or ""
+    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", url):
+        data = dict(data)
+        data["url"] = pathlib.Path(path).resolve().parent.joinpath(url).resolve().as_uri()
+    return parse(data)

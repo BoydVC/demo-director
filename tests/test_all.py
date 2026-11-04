@@ -45,9 +45,9 @@ class EndToEnd(unittest.TestCase):
         out = tempfile.mkdtemp()
         res = direct(shotlist.parse(example()), out, scale=0.4)
         for asp, (W, H) in shotlist.ASPECTS.items():
-            g = Image.open(res[asp]["gif"])
-            self.assertEqual(g.size, (int(W * .4) // 2 * 2, int(H * .4) // 2 * 2))
-            self.assertGreater(g.n_frames, 40)
+            with Image.open(res[asp]["gif"]) as g:
+                self.assertEqual(g.size, (int(W * .4) // 2 * 2, int(H * .4) // 2 * 2))
+                self.assertGreater(g.n_frames, 40)
             self.assertGreater(os.path.getsize(res[asp]["mp4"]), 1000)
 
 if __name__ == "__main__":

@@ -1,0 +1,45 @@
+{
+  "ok": true,
+  "budget_bytes": 5242880,
+  "items": [
+    {
+      "source": "examples/weekend-planner.json",
+      "error": null,
+      "renders": [
+        {
+          "title": "Weekend Planner demo",
+          "aspect": "16:9",
+          "frames": 77,
+          "bytes": 254047,
+          "mp4_bytes": 66364,
+          "duration": 7.7,
+          "gif": "shots/demo-16x9.gif",
+          "mp4": "shots/demo-16x9.mp4",
+          "within_budget": true
+        },
+        {
+          "title": "Weekend Planner demo",
+          "aspect": "1:1",
+          "frames": 77,
+          "bytes": 237043,
+          "mp4_bytes": 62711,
+          "duration": 7.7,
+          "gif": "shots/demo-1x1.gif",
+          "mp4": "shots/demo-1x1.mp4",
+          "within_budget": true
+        },
+        {
+          "title": "Weekend Planner demo",
+          "aspect": "9:16",
+          "frames": 77,
+          "bytes": 271899,
+          "mp4_bytes": 45735,
+          "duration": 7.7,
+          "gif": "shots/demo-9x16.gif",
+          "mp4": "shots/demo-9x16.mp4",
+          "within_budget": true
+        }
+      ]
+    }
+  ]
+}

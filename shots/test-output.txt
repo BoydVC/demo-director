@@ -1,2 +1,33 @@
+test_ease_endpoints (test_all.ComposeTests.test_ease_endpoints) ... ok
+test_fit_aspect_sizes (test_all.ComposeTests.test_fit_aspect_sizes) ... ok
+test_no_zoom_is_full (test_all.ComposeTests.test_no_zoom_is_full) ... ok
+test_zoom_stays_in_frame (test_all.ComposeTests.test_zoom_stays_in_frame) ... ok
+test_render_real_browser (test_all.EndToEnd.test_render_real_browser) ... ok
+test_bad_aspect (test_all.ShotListTests.test_bad_aspect) ... ok
+test_example_parses (test_all.ShotListTests.test_example_parses) ... ok
+test_rejects (test_all.ShotListTests.test_rejects) ... ok
+test_budget_fails_closed (test_batch.BatchTests.test_budget_fails_closed) ... ok
+test_examples_batch_is_under_budget (test_batch.BatchTests.test_examples_batch_is_under_budget) ... ok
+test_gallery_row_lists_every_aspect (test_batch.BatchTests.test_gallery_row_lists_every_aspect) ... ok
+test_action_renders_on_push_and_does_not_post (test_ci.CiTests.test_action_renders_on_push_and_does_not_post) ... ok
+test_recording_keeps_label_and_text_ink (test_framing.FramingTests.test_recording_keeps_label_and_text_ink) ... ok
+test_tall_caption_stays_in_the_safe_area (test_framing.FramingTests.test_tall_caption_stays_in_the_safe_area) ... ok
+test_zoom_keeps_a_wide_target_fully_visible (test_framing.FramingTests.test_zoom_keeps_a_wide_target_fully_visible) ... ok
+test_zoom_keeps_the_label_left_of_a_target (test_framing.FramingTests.test_zoom_keeps_the_label_left_of_a_target) ... ok
+test_draft_is_typed_and_synthetic (test_init.InitTests.test_draft_is_typed_and_synthetic) ... ok
+test_init_readme_uses_headings_and_visible_controls (test_init.InitTests.test_init_readme_uses_headings_and_visible_controls) ... ok
+test_caption_email_blocks_before_render (test_pii.PiiTests.test_caption_email_blocks_before_render) ... ok
+test_denylist_and_false_friends (test_pii.PiiTests.test_denylist_and_false_friends) ... ok
+test_page_email_blocks_the_batch (test_pii.PiiTests.test_page_email_blocks_the_batch) ... ok
+test_page_phone_and_configured_name_block (test_pii.PiiTests.test_page_phone_and_configured_name_block) ... ok
+test_unreadable_text_fails_closed (test_pii.PiiTests.test_unreadable_text_fails_closed) ... ok
+test_beat_carries_the_label_box (test_types.TypeTests.test_beat_carries_the_label_box) ... ok
+test_fixture_token_resolves_on_load (test_types.TypeTests.test_fixture_token_resolves_on_load) ... ok
+test_illegal_variants_cannot_be_built (test_types.TypeTests.test_illegal_variants_cannot_be_built) ... ok
+test_round_trip (test_types.TypeTests.test_round_trip) ... ok
+test_steps_are_a_union (test_types.TypeTests.test_steps_are_a_union) ... ok
+
+----------------------------------------------------------------------
+Ran 28 tests in 27.002s
 
 OK

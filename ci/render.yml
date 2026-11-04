@@ -1,0 +1,41 @@
+# Renders demo GIFs on push and uploads them as artifacts.
+# Synthetic data only. This workflow never posts anywhere.
+name: render-demos
+on:
+  push:
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install pillow playwright
+          python -m playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Test
+        run: python -m unittest discover -s tests
+
+      - name: Render
+        run: python -m demo_director batch examples/ -o shots
+
+      - name: Upload demos
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-gifs
+          path: |
+            shots/*.gif
+            shots/*.mp4
+            shots/index.html
+            shots/report.json
+            shots/gallery.png
+          if-no-files-found: error

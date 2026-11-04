@@ -56,6 +56,16 @@ def status_for(rows: list[dict], failure: str | None = None) -> str:
     return "ok"
 
 
+def failure_summary(exc: RecordingFailure) -> str:
+    """Kind, step index, and selector. The status alone is not a report."""
+    parts = [f"{exc.kind} at step {exc.step_index}"]
+    if exc.selector:
+        parts.append(exc.selector)
+    if exc.detail and exc.detail not in {exc.kind, exc.selector, "no beat"}:
+        parts.append(exc.detail)
+    return " ".join(parts)
+
+
 def _slug(title: str) -> str:
     cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in title).strip("-")
     squashed = "-".join(part for part in cleaned.split("-") if part)
@@ -75,10 +85,13 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
         sl = replace(sl, pii=PiiPolicy(names=tuple(sl.pii.names) + tuple(extra_names)))
     item["title"] = sl.title
     try:
-        rendered = direct(sl, outdir, scale)
+        rendered = direct(sl, outdir, scale, budget)
     except RecordingFailure as exc:
         item["status"] = exc.kind
-        item["error"] = exc.detail or exc.kind
+        item["kind"] = exc.kind
+        item["step"] = exc.step_index
+        item["selector"] = exc.selector or None
+        item["error"] = failure_summary(exc)
         return item
     rows = []
     for aspect in _ASPECT_ORDER:
@@ -86,8 +99,16 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
             continue
         info = rendered[aspect]
         row = aspect_record(
-            info["frames"], os.path.getsize(info["gif"]), sl.fps, budget, info["gif"], info["mp4"]
+            info["frames"],
+            os.path.getsize(info["gif"]),
+            int(info.get("fps", sl.fps)),
+            budget,
+            info["gif"],
+            info["mp4"],
         )
+        row["attempts"] = info.get("attempts", 1)
+        row["scale"] = info.get("scale", scale)
+        row["fps"] = info.get("fps", sl.fps)
         item["aspects"][aspect] = row
         rows.append(row)
     item["status"] = status_for(rows)

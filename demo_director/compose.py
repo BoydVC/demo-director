@@ -381,6 +381,25 @@ def _card_bg(size: tuple[int, int]) -> Image.Image:
     return small.resize((width, height), Image.BICUBIC)
 
 
+def _fit(draw: ImageDraw.ImageDraw, text: str, size: int, style: str, width: int, floor: int = 14):
+    """Largest face at or under ``size`` whose text fits in 90% of the width.
+
+    A fixed width//16 face clips a long title on both edges. Shrink until it
+    fits. The floor is a preference; a title that is still wider keeps
+    shrinking so the card never paints past the frame.
+    """
+    face = font(size, style)
+    limit = width * 0.9
+    while size > floor and draw.textlength(text, font=face) > limit:
+        nxt = int(size * 0.92)
+        size = floor if nxt <= floor else nxt
+        face = font(size, style)
+    while size > 6 and draw.textlength(text, font=face) > limit:
+        size -= 1
+        face = font(size, style)
+    return face
+
+
 def _centered(draw: ImageDraw.ImageDraw, text: str, face: ImageFont.ImageFont, y: float, width: int,
               fill, alpha: float) -> None:
     tw = draw.textlength(text, font=face)
@@ -400,7 +419,7 @@ def title_card(size: tuple[int, int], title: str, t: float, subtitle: str | None
         draw.rounded_rectangle((width / 2 - rule / 2, cy - 36, width / 2 + rule / 2, cy - 31), radius=2, fill=ACCENT + (int(255 * t),))
     eyebrow = font(max(12, width // 52), "medium")
     _centered(draw, "SYNTHETIC DEMO", eyebrow, cy - 78, width, ACCENT, t)
-    face = font(max(26, width // 16), "bold")
+    face = _fit(draw, title, max(26, width // 16), "bold", width)
     _centered(draw, title, face, cy - 8, width, INK, t)
     if subtitle:
         sub = font(max(14, width // 38), "regular")
@@ -419,7 +438,7 @@ def end_card(size: tuple[int, int], title: str, t: float) -> Image.Image:
     rule = int(lerp(0, min(120, width * 0.12), t))
     if rule > 2:
         draw.rounded_rectangle((width / 2 - rule / 2, cy - 28, width / 2 + rule / 2, cy - 23), radius=2, fill=ACCENT + (int(255 * t),))
-    face = font(max(24, width // 18), "bold")
+    face = _fit(draw, title, max(24, width // 18), "bold", width)
     _centered(draw, title, face, cy - 4, width, INK, t)
     sub = font(max(14, width // 40), "medium")
     _centered(draw, "Synthetic data only", sub, cy + face.size + 16, width, MUTED, t)
@@ -435,6 +454,53 @@ def _inside(box: Box, crop: Box, slop: float = 0.75) -> bool:
 def _hits(box: Box, crop: Box) -> bool:
     x, y, w, h = crop
     return not (box[0] + box[2] < x or box[0] > x + w or box[1] + box[3] < y or box[1] > y + h)
+
+
+def contain_left_text(crop: Box, lines: tuple[Box, ...], must: tuple[Box, ...], size: tuple[int, int]) -> Box:
+    """Grow a crop so a text block cut on the left stays whole, with the target.
+
+    A 1.6x window aimed at a right-hand control slices a left-aligned heading
+    ("nd Men's Basketball", "eyboard Kickoff"). Sliding the window cannot keep
+    both, so the crop widens until the heading, the label, and the target sit
+    inside the frame. Text that is wider than the frame is pinned to the left
+    edge, so the start of the line is what remains visible.
+    """
+    width, height = size
+    x, y, w, h = crop
+    extra = []
+    for line in lines:
+        if _inside(line, crop) or line[0] >= x - 0.25:
+            continue
+        overlaps_y = not (line[1] + line[3] < y or line[1] > y + h)
+        # Sliced on the left, or sitting in the same band and fully left of
+        # the window. Either way the left-aligned block has to come inside.
+        if (_hits(line, crop) and not _inside(line, crop)) or overlaps_y:
+            extra.append(line)
+    if not extra:
+        return crop
+    boxes = (crop, *must, *extra)
+    x0 = min(box[0] for box in boxes)
+    y0 = min(box[1] for box in boxes)
+    x1 = max(box[0] + box[2] for box in boxes)
+    y1 = max(box[1] + box[3] for box in boxes)
+    pad = 12.0
+    x0, y0 = max(0.0, x0 - pad), max(0.0, y0 - pad)
+    x1, y1 = min(float(width), x1 + pad), min(float(height), y1 + pad)
+    for box in (*must, *extra):
+        x0 = min(x0, max(0.0, box[0]))
+        y0 = min(y0, max(0.0, box[1]))
+        x1 = max(x1, min(float(width), box[0] + box[2]))
+        y1 = max(y1, min(float(height), box[1] + box[3]))
+    if x1 - x0 >= width - 1:
+        x0, x1 = 0.0, float(width)
+    if y1 - y0 >= height - 1:
+        y0, y1 = 0.0, float(height)
+    # A left-aligned block that still starts left of the crop is pinned so
+    # the first letters are in frame even when the line cannot fit whole.
+    left = min(line[0] for line in extra)
+    if left < x0:
+        x0 = max(0.0, left - pad)
+    return (x0, y0, max(1.0, x1 - x0), max(1.0, y1 - y0))
 
 
 def unsliced(crop: Box, lines: tuple[Box, ...], must: tuple[Box, ...], size: tuple[int, int]) -> Box:

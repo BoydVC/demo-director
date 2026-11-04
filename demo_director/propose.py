@@ -34,7 +34,7 @@ _HREF = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 _BARE_HTML = re.compile(r"(?<![\w/])([\w./-]+\.html?)(?![\w.])")
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-_DISCOVER_JS = """
+_DISCOVER_JS = r"""
 () => {
   const visible = (el) => {
     const r = el.getBoundingClientRect();
@@ -59,21 +59,72 @@ _DISCOVER_JS = """
     }
     return parts.join(" > ");
   };
-  const textOf = (el) => (el.innerText || el.value || el.getAttribute("placeholder") || "").trim().replace(/\\s+/g, " ").slice(0, 80);
+  const textOf = (el) => (el.innerText || el.value || el.getAttribute("placeholder") || "").trim().replace(/\s+/g, " ").slice(0, 80);
+  const accessibleName = (el) => {
+    const labelledby = el.getAttribute("aria-labelledby");
+    if (labelledby) {
+      const text = labelledby.split(/\s+/).map((id) => {
+        const node = document.getElementById(id);
+        return node ? (node.innerText || "") : "";
+      }).join(" ").replace(/\s+/g, " ").trim();
+      if (text) return text.slice(0, 80);
+    }
+    const aria = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    if (aria) return aria.slice(0, 80);
+    if (el.id) {
+      const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (lab && (lab.innerText || "").trim()) return lab.innerText.replace(/\s+/g, " ").trim().slice(0, 80);
+    }
+    return textOf(el);
+  };
+  const implicitRole = (el) => {
+    const explicit = (el.getAttribute("role") || "").trim().toLowerCase();
+    if (explicit) return explicit;
+    const tag = el.tagName;
+    if (tag === "BUTTON") return "button";
+    if (tag === "TEXTAREA") return "textbox";
+    if (tag === "A" && el.hasAttribute("href")) return "link";
+    if (tag === "INPUT") {
+      const t = (el.getAttribute("type") || "text").toLowerCase();
+      if (t === "button" || t === "submit") return "button";
+      return "textbox";
+    }
+    return "";
+  };
+  const quote = (value) => String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const named = (role, name) => [...document.querySelectorAll("button, a, input, textarea, [role]")].filter((el) => {
+    return implicitRole(el) === role && accessibleName(el) === name;
+  });
+  // data-testid, id, then role/text. nth-of-type is only the last resort.
+  const selectorOf = (el) => {
+    const testid = el.getAttribute("data-testid");
+    if (testid) return '[data-testid="' + CSS.escape(testid) + '"]';
+    if (el.id) return "#" + CSS.escape(el.id);
+    const role = implicitRole(el);
+    const name = accessibleName(el);
+    if (role && name && named(role, name).length === 1) {
+      return 'role=' + role + '[name="' + quote(name) + '"]';
+    }
+    if (name && (el.tagName === "BUTTON" || role === "button")) {
+      const count = named(role || "button", name).length;
+      if (count === 1) return 'text="' + quote(name) + '"';
+    }
+    return cssOf(el);
+  };
   const inputs = [...document.querySelectorAll("input, textarea")].filter((el) => {
     const kind = (el.getAttribute("type") || "text").toLowerCase();
     return !["hidden", "submit", "button", "checkbox", "radio", "file"].includes(kind) && visible(el);
   }).slice(0, 4).map((el) => ({
-    selector: cssOf(el),
+    selector: selectorOf(el),
     placeholder: el.getAttribute("placeholder") || "",
-    type: (el.getAttribute("type") || "").toLowerCase()
+    type: (el.getAttribute("type") || "text").toLowerCase()
   }));
   const buttons = [...document.querySelectorAll("button, [role=button], input[type=submit], input[type=button]")]
     .filter(visible).slice(0, 6)
-    .map((el) => ({selector: cssOf(el), text: textOf(el)}));
+    .map((el) => ({selector: selectorOf(el), text: textOf(el)}));
   const title = ((document.querySelector("h1") && document.querySelector("h1").innerText) || document.title || "Demo").trim().slice(0, 80);
   const results = [...document.querySelectorAll("#conf, #status, #result, #output, [data-result], .result")]
-    .filter(visible).slice(0, 2).map(cssOf);
+    .filter(visible).slice(0, 2).map(selectorOf);
   const text = document.body ? (document.body.innerText || "") : "";
   return {title, inputs, buttons, results, text};
 }
@@ -85,6 +136,7 @@ class Control:
     selector: str
     kind: Literal["input", "button"]
     label: str
+    input_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -110,11 +162,34 @@ def public_text(text: str, fallback: str) -> str:
     return cleaned[:80]
 
 
-def synthetic_value(placeholder: str) -> str:
-    """A value we invent. Never the field's current contents, never contact data."""
+_TYPED = {
+    "date": "2026-11-07",
+    "time": "10:00",
+    "datetime-local": "2026-11-07T10:00",
+    "month": "2026-11",
+    "week": "2026-W45",
+    "number": "3",
+    "range": "5",
+    "color": "#3366ff",
+    "url": "https://example.test",
+    "search": "demo",
+}
+# Any address shape, reserved or not. The guard may allow example.com on a
+# page; we still do not type contact data into a field.
+_EMAIL_SHAPE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def synthetic_value(placeholder: str, input_type: str = "") -> str:
+    """A value we invent. Never the field's current contents, never contact data.
+
+    Date, time, number, and the other typed inputs get a value the browser
+    will accept. ``"Sample"`` is what ``fill`` rejects on ``input type=date``.
+    """
+    if input_type in _TYPED:
+        return _TYPED[input_type]
     cleaned = placeholder.replace("…", "").replace("...", "").strip(" .")
     cleaned = " ".join(cleaned.split())
-    if not cleaned or hits(cleaned):
+    if not cleaned or hits(cleaned) or _EMAIL_SHAPE.search(cleaned):
         return "Sample"
     return f"{cleaned} (demo)"[:80]
 
@@ -196,7 +271,7 @@ def draft_from(title: str, url: str, headings: tuple[str, ...] | list[str],
             if not str(control.selector).strip():
                 continue
             if control.kind == "input":
-                add(Type(control.selector, synthetic_value(control.label), frames=8), "input", control.selector)
+                add(Type(control.selector, synthetic_value(control.label, control.input_type), frames=8), "input", control.selector)
             else:
                 label = public_text(control.label, "Button")
                 add(Click(control.selector, frames=6), "button", f"{label} {control.selector}".strip())
@@ -222,32 +297,91 @@ def dump_draft(draft: Draft) -> dict:
     return data
 
 
+def _selector_visible(page, selector: str) -> bool:
+    if not str(selector).strip():
+        return False
+    loc = page.locator(selector)
+    try:
+        if loc.count() < 1:
+            return False
+        return bool(loc.first.is_visible())
+    except Exception:
+        return False
+
+
+def _act(page, control: Control) -> None:
+    if control.kind == "input":
+        page.fill(control.selector, synthetic_value(control.label, control.input_type), timeout=2500)
+    else:
+        page.click(control.selector, timeout=2500)
+
+
+def _controls_from(raw: dict) -> list[Control]:
+    controls: list[Control] = []
+    for field in raw.get("inputs") or []:
+        controls.append(Control(
+            str(field.get("selector") or ""),
+            "input",
+            str(field.get("placeholder") or ""),
+            str(field.get("type") or ""),
+        ))
+    for button in raw.get("buttons") or []:
+        controls.append(Control(str(button.get("selector") or ""), "button", str(button.get("text") or "")))
+    return controls
+
+
+def _runnable(page, controls: list[Control]) -> list[Control]:
+    """Drop controls hidden by an earlier drafted action.
+
+    The page is probed again after each action that succeeds. A tab that
+    hides the other panel's button is not followed by a click on that button.
+    An action the browser rejects is left out, so the draft can be replayed.
+    """
+    kept: list[Control] = []
+    for control in controls:
+        if not _selector_visible(page, control.selector):
+            continue
+        try:
+            _act(page, control)
+        except Exception:
+            continue
+        kept.append(control)
+    return kept
+
+
 def probe(url: str) -> tuple[PageControls, tuple[str, ...], str]:
     from playwright.sync_api import sync_playwright
+
+    from .director import classify_failure, refuse_unusable
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         try:
             page = browser.new_page(viewport={"width": 1280, "height": 800})
             try:
-                page.goto(url, timeout=15000)
+                response = page.goto(url, timeout=15000)
+            except Exception as exc:
+                kind = classify_failure(exc, navigating=True)
+                raise RecordingFailure(kind, -1, "navigation") from exc
+            try:
                 raw = page.evaluate(_DISCOVER_JS)
             except Exception as exc:
-                raise RecordingFailure("timeout", -1, "navigation") from exc
+                raise RecordingFailure(classify_failure(exc), -1, "navigation") from exc
+            if not isinstance(raw, dict) or not isinstance(raw.get("text"), str):
+                raise RecordingFailure("pii-blocked", -1, "unreadable")
+            text = raw["text"]
+            found = hits(text)
+            if found:
+                raise RecordingFailure("pii-blocked", -1, ",".join(found))
+            refuse_unusable(page, response)
+            controls = _runnable(page, _controls_from(raw))
+            results = tuple(
+                item for item in (str(entry) for entry in (raw.get("results") or []) if entry)
+                if _selector_visible(page, item)
+            )
+            return PageControls(title=str(raw.get("title") or "Demo"), controls=tuple(controls)), results, text
         finally:
             browser.close()
-    if not isinstance(raw, dict) or not isinstance(raw.get("text"), str):
-        raise RecordingFailure("pii-blocked", -1, "unreadable")
-    controls: list[Control] = []
-    for field in raw.get("inputs") or []:
-        selector = str(field.get("selector") or "")
-        label = str(field.get("placeholder") or "")
-        controls.append(Control(selector, "input", label))
-    for button in raw.get("buttons") or []:
-        selector = str(button.get("selector") or "")
-        controls.append(Control(selector, "button", str(button.get("text") or "")))
-    results = tuple(str(item) for item in (raw.get("results") or []) if item)
-    return PageControls(title=str(raw.get("title") or "Demo"), controls=tuple(controls)), results, raw["text"]
 
 
 def from_page(url: str, fallback: str = "Demo") -> Draft:

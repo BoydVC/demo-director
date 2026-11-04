@@ -6,7 +6,9 @@ import unittest
 
 from PIL import Image
 
-from demo_director.batch import GIF_BUDGET, aspect_record, batch, expand_inputs, status_for
+from demo_director.batch import GIF_BUDGET, aspect_record, batch, expand_inputs, failure_summary, status_for
+from demo_director.director import fallback_plan
+from demo_director.session import RecordingFailure
 from demo_director.ci import workflow_text, workflow_violations
 from demo_director.director import direct, frames_for, record
 from demo_director.gallery import write_gallery
@@ -81,6 +83,49 @@ class BatchTests(unittest.TestCase):
             self.assertIn(name, text)
         self.assertIn("Synthetic data only", text)
         self.assertNotIn("<script", text.lower())
+
+    def test_failure_summary_names_step_kind_and_selector(self):
+        exc = RecordingFailure("selector-missing", 2, "missing", "nav > button:nth-of-type(3)")
+        text = failure_summary(exc)
+        self.assertIn("selector-missing", text)
+        self.assertIn("step 2", text)
+        self.assertIn("nav > button:nth-of-type(3)", text)
+
+    def test_over_budget_retries_lower_scale_or_fps(self):
+        plan = fallback_plan(0.75, 10)
+        self.assertEqual(plan[0], (0.75, 10))
+        self.assertTrue(any(fps < 10 and scale == 0.75 for scale, fps in plan))
+        self.assertTrue(any(scale <= 0.51 for scale, fps in plan))
+        self.assertTrue(all(scale >= 0.24 and fps >= 4 for scale, fps in plan))
+
+        data = json.loads((ROOT / "examples/weekend-planner.json").read_text())
+        data["url"] = (ROOT / "fixtures/app.html").resolve().as_uri()
+        data["aspects"] = ["16:9"]
+        data["steps"] = [
+            {"action": "click", "selector": "#pack", "frames": 4},
+            {"action": "zoom", "selector": "#conf", "frames": 6},
+        ]
+        folder = pathlib.Path(tempfile.mkdtemp())
+        path = folder / "wide.json"
+        path.write_text(json.dumps(data))
+        first_dir = tempfile.mkdtemp()
+        from demo_director.director import direct
+        from demo_director.shotlist import parse
+        first = direct(parse(data), first_dir, scale=0.6)
+        first_bytes = pathlib.Path(first["16:9"]["gif"]).stat().st_size
+        first_frames = first["16:9"]["frames"]
+        with Image.open(first["16:9"]["gif"]) as opened:
+            first_w = opened.size[0]
+        out = tempfile.mkdtemp()
+        report = batch([str(path)], out, scale=0.6, budget=max(1, first_bytes - 1))
+        item = report["items"][0]
+        row = item["aspects"]["16:9"]
+        self.assertEqual(item["status"], "ok", report)
+        self.assertLessEqual(row["bytes"], first_bytes - 1)
+        self.assertGreater(row["attempts"], 1)
+        with Image.open(row["gif"]) as opened:
+            shrunk = row["frames"] < first_frames or opened.size[0] < first_w
+        self.assertTrue(shrunk, row)
 
     def test_workflow_renders_on_push_and_does_not_post(self):
         text = workflow_text()

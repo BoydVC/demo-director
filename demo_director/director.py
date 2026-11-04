@@ -2,7 +2,9 @@
 
 Every step goes through ``session.run_step``. The only way to append a beat is
 for that call to return ``captured`` with the beat count increased by one.
-PII, a missing selector, or a timeout returns a typed failure and no beat.
+A missing selector, a control that is not visible, a refused navigation, an
+invalid value, a blank page, a timeout, or PII returns a typed failure and
+no beat.
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -108,9 +111,22 @@ _LABEL_JS = """
   }
   function collectLines() {
     const out = [];
-    document.querySelectorAll("h1,h2,h3,button,.card,.sub,#conf,#status,.tag,label,p").forEach((node) => {
+    const push = (box) => {
+      if (!box || box.w < 8 || box.h < 8 || box.h > 180) return;
+      out.push(box);
+    };
+    document.querySelectorAll("h1,h2,h3,h4,header,button,.card,.sub,.hero,.kick,#conf,#status,.tag,label,p,[role=heading]").forEach((node) => {
+      push(ink(node));
+    });
+    // Left-aligned blocks the zoom must not slice, even when they are not the
+    // control's own label. A div title is the usual shape.
+    document.querySelectorAll("div,span,li,strong,a").forEach((node) => {
+      if (node.childElementCount > 2) return;
       const box = ink(node);
-      if (box.w > 4 && box.h > 4 && box.h < 90) out.push(box);
+      if (!box || box.x > 120) return;
+      const text = (node.innerText || "").trim();
+      if (text.length < 4 || text.length > 90) return;
+      push(box);
     });
     document.querySelectorAll("input, textarea").forEach((node) => {
       const r = node.getBoundingClientRect();
@@ -186,21 +202,129 @@ def _snap(page) -> Image.Image:
     return Image.open(io.BytesIO(page.screenshot())).convert("RGB")
 
 
+def classify_failure(exc: BaseException, *, navigating: bool = False) -> str:
+    """Map a browser exception to the failure it actually is.
+
+    ``_perform`` used to send every exception down the timeout edge, so a
+    malformed date fill and a covered click both came back as timeout.
+    """
+    name = type(exc).__name__.casefold()
+    text = f"{name}: {exc}".casefold()
+    if any(token in text for token in (
+        "element is not visible",
+        "element is hidden",
+        "intercepts pointer",
+        "outside of the viewport",
+        "not attached to the dom",
+    )):
+        return "not-visible"
+    if any(token in text for token in (
+        "malformed value",
+        "invalid value",
+        "cannot type",
+        "cannot fill",
+    )):
+        return "invalid-value"
+    if any(token in text for token in (
+        "unknown engine",
+        "malformed selector",
+        "strict mode violation",
+        "no element matches",
+    )):
+        return "selector-missing"
+    network = any(token in text for token in (
+        "net::",
+        "ns_error",
+        "err_connection",
+        "err_name",
+        "err_address",
+        "err_aborted",
+        "err_failed",
+        "err_internet",
+        "err_socket",
+        "frame was detached",
+        "download is starting",
+        "page crashed",
+        "navigation failed",
+    ))
+    timed = "timeout" in name or "timeout" in text
+    if network:
+        return "nav-error"
+    if navigating:
+        return "timeout" if timed else "nav-error"
+    if timed:
+        return "timeout"
+    return "invalid-value"
+
+
+_PAGE_STATE_JS = """
+() => {
+  const text = document.body ? (document.body.innerText || "").replace(/\\s+/g, " ").trim() : "";
+  let styled = false;
+  for (const sheet of document.styleSheets) {
+    try {
+      if (sheet.cssRules && sheet.cssRules.length > 0) { styled = true; break; }
+    } catch (e) {
+      styled = true;
+      break;
+    }
+  }
+  return {text, styled};
+}
+"""
+
+
+def page_problem(page, response) -> str | None:
+    """Blank, unstyled, or HTTP error. None when the page is demoable.
+
+    A style tag with no rules (an unfilled ``/*__CSS__*/`` template) counts
+    as unstyled. ``file:`` loads report status 0 or 200 and are not errors.
+    """
+    status = getattr(response, "status", None) if response is not None else None
+    if isinstance(status, int) and status >= 400:
+        return f"http-{status}"
+    try:
+        raw = page.evaluate(_PAGE_STATE_JS)
+    except Exception:
+        return "no-visible-text"
+    if not isinstance(raw, dict):
+        return "no-visible-text"
+    text = raw.get("text") if isinstance(raw.get("text"), str) else ""
+    if not raw.get("styled"):
+        return "unstyled"
+    if not text.strip():
+        return "no-visible-text"
+    return None
+
+
+def refuse_unusable(page, response, step_index: int = -1) -> None:
+    """Warn and fail the take when the page is blank, unstyled, or an error."""
+    problem = page_problem(page, response)
+    if not problem:
+        return
+    warnings.warn(f"page is not demoable: {problem}", RuntimeWarning, stacklevel=2)
+    raise RecordingFailure("blank-page", step_index, problem)
+
+
 def _probe(page, selector: str, timeout_ms: int = 3000):
-    """Return (found, box, label, lines, timed_out). Missing and timeout stay distinct."""
+    """Return (found, box, label, lines, problem).
+
+    ``problem`` is None, ``selector-missing``, ``not-visible``, or ``timeout``.
+    A node that exists but has no box is hidden, not missing.
+    """
     loc = page.locator(selector).first
     try:
         count = loc.count()
-    except Exception:
-        return False, None, None, (), True
+    except Exception as exc:
+        return False, None, None, (), classify_failure(exc)
     if count == 0:
-        return False, None, None, (), False
+        return False, None, None, (), "selector-missing"
     try:
         bb = loc.bounding_box(timeout=timeout_ms)
-    except Exception:
-        return False, None, None, (), True
+    except Exception as exc:
+        return False, None, None, (), classify_failure(exc)
     if not bb:
-        return False, None, None, (), False
+        return False, None, None, (), "not-visible"
     box = label = None
     lines: tuple[Box, ...] = ()
     try:
@@ -213,12 +337,13 @@ def _probe(page, selector: str, timeout_ms: int = 3000):
         lines = tuple(item for item in (_box(row) for row in (raw.get("lines") or [])) if item)
     if box is None:
         box = (bb["x"], bb["y"], bb["width"], bb["height"])
-    return True, box, label, lines, False
+    return True, box, label, lines, None
 
 
 def _perform(page, step) -> None:
     if step.action == "goto":
-        page.goto(step.url, timeout=15000)
+        response = page.goto(step.url, timeout=15000)
+        refuse_unusable(page, response)
     elif step.action == "click":
         page.click(step.selector, timeout=5000)
     elif step.action == "type":
@@ -230,11 +355,12 @@ def _drive_step(page, session: Session, step, names: tuple[str, ...]) -> tuple[S
     needs = step.action in {"click", "type", "zoom"}
     text = _page_text(page)
     pii = bool(hits(text, names))
-    found, box, label, lines, nav_timeout = True, None, None, (), False
+    found, box, label, lines, problem = True, None, None, (), None
     if needs and not pii:
-        found, box, label, lines, nav_timeout = _probe(page, step_selector(step) or "")
-    timeout_at = "navigating" if nav_timeout else None
-    pre = StepSignals(needs, found, timeout_at, pii, False)
+        found, box, label, lines, problem = _probe(page, step_selector(step) or "")
+    timeout_at = "navigating" if problem == "timeout" else None
+    action_error = None if problem in (None, "timeout") else problem
+    pre = StepSignals(needs, problem is None, timeout_at, pii, False, action_error)
     trial = run_step(session, pre)
     if trial.failure or trial.pii_seen:
         return trial, None
@@ -245,18 +371,21 @@ def _drive_step(page, session: Session, step, names: tuple[str, ...]) -> tuple[S
         failed = run_step(session, StepSignals(needs, found, "navigating", pii, False))
         return failed, None
 
-    acted_timeout = False
     try:
         _perform(page, step)
-    except Exception:
-        acted_timeout = True
-    if acted_timeout:
+    except RecordingFailure:
+        raise
+    except Exception as exc:
+        # A navigation that destroys the document makes the read fail. That is
+        # the navigation error, not an unreadable-text PII hit. A string that
+        # actually contains a real address still blocks.
         text_after = _page_text(page)
-        pii_after = bool(hits(text_after, names))
-        if pii_after:
+        reasons = hits(text_after, names) if isinstance(text_after, str) else ()
+        if reasons:
             failed = run_step(session, StepSignals(needs, found, None, pii, True))
         else:
-            failed = run_step(session, StepSignals(needs, found, "acting", pii, False))
+            kind = classify_failure(exc, navigating=step.action == "goto")
+            failed = run_step(session, StepSignals(needs, found, None, pii, False, kind))
         return failed, None
 
     text_after = _page_text(page)
@@ -298,18 +427,32 @@ def record(sl: ShotList) -> list[Beat]:
         try:
             page = browser.new_page(viewport={"width": sl.viewport[0], "height": sl.viewport[1]})
             try:
-                page.goto(sl.url, timeout=15000)
+                response = page.goto(sl.url, timeout=15000)
             except Exception as exc:
-                raise RecordingFailure("timeout", -1, "navigation") from exc
+                kind = classify_failure(exc, navigating=True)
+                raise RecordingFailure(kind, -1, "navigation") from exc
             opening = _page_text(page)
             opening_hits = hits(opening, names)
             if opening_hits:
                 blocked = run_step(session, StepSignals(False, True, None, True, False))
                 raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(opening_hits))
+            refuse_unusable(page, response)
             for index, step in enumerate(sl.steps):
-                session, beat = _drive_step(page, session, step, names)
+                try:
+                    session, beat = _drive_step(page, session, step, names)
+                except RecordingFailure as exc:
+                    selector = exc.selector or step_selector(step) or ""
+                    raise RecordingFailure(exc.kind, index, exc.detail, selector) from exc
                 if beat is None:
-                    raise RecordingFailure(session.failure or "timeout", index, session.failure or "no beat")
+                    selector = step_selector(step) or getattr(step, "url", "") or ""
+                    detail = session.failure or "no beat"
+                    if session.failure == "nav-error":
+                        detail = "navigation"
+                    elif session.failure == "invalid-value":
+                        detail = "invalid-value"
+                    elif session.failure == "not-visible":
+                        detail = "not-visible"
+                    raise RecordingFailure(session.failure or "timeout", index, detail, selector)
                 beats.append(beat)
                 if session.beats != len(beats):
                     raise RecordingFailure("timeout", index, "beat invariant")
@@ -327,14 +470,21 @@ def lead_line(sl: ShotList) -> str | None:
 
 
 def _frame(box, size, amount, label, lines=()):
-    """Crop that keeps the target and its label, then slides off any sliced text."""
+    """Crop that keeps the target, its label, and any left-aligned text it would cut."""
     if box is None or amount <= 0:
         return compose.frame_rect(None, size, 0, None)
     focus = label if label is not None else box
     crop = compose.frame_rect(box, size, amount, focus)
     must = tuple(item for item in (box, focus) if item)
     if lines:
-        crop = compose.unsliced(crop, tuple(lines), must, size)
+        crop = compose.contain_left_text(crop, tuple(lines), must, size)
+        # Lines the widen step just pulled in have to stay put. unsliced may
+        # slide off some other sliced row, but not back through the heading.
+        kept = tuple(
+            line for line in lines
+            if compose._inside(line, crop) and line[0] <= size[0] * 0.12
+        )
+        crop = compose.unsliced(crop, tuple(lines), must + kept, size)
     return crop
 
 
@@ -342,9 +492,15 @@ def _content_frames(beats: list[Beat], out: tuple[int, int], aspect: str):
     cursor = (beats[0].before.width / 2, beats[0].before.height / 2)
     caption = None
     zoom_t, zoom_box, zoom_label = 0.0, None, None
+    # Hold and caption beats do not probe a selector, so they carry no text
+    # boxes. Keep the lines from the zoom that is still on screen; otherwise
+    # the hold recomputes a tight crop and slices the heading the zoom just fit.
+    zoom_lines: tuple = ()
     for beat in beats:
         step = beat.step
-        lines = beat.lines
+        if beat.lines:
+            zoom_lines = beat.lines
+        lines = beat.lines or zoom_lines
         if step.action == "caption":
             caption = step_text(step)
             crop = _frame(zoom_box, beat.after.size, zoom_t, zoom_label, lines)
@@ -391,6 +547,46 @@ def frames_for(beats: list[Beat], out: tuple[int, int], title: str = "", aspect:
         yield compose.end_card(out, title, (i + 1) / END_FRAMES)
 
 
+def fallback_plan(scale: float, fps: int) -> list[tuple[float, int]]:
+    """Scale and fps pairs to try when a GIF is over the byte budget.
+
+    The first pair is the request. Later pairs halve the frame rate, then
+    drop the scale by a third, and stop around a quarter of the frame or 4 fps.
+    """
+    s = float(scale)
+    original = max(1, int(fps))
+    f = original
+    plan: list[tuple[float, int]] = []
+    for _ in range(5):
+        pair = (round(s, 4), int(f))
+        if pair not in plan and s > 0 and f >= 1:
+            plan.append(pair)
+        if f > 5:
+            f = max(4, f // 2)
+            continue
+        nxt = round(s * 0.67, 4)
+        if nxt < 0.24 or nxt >= s:
+            break
+        s, f = nxt, original
+    return plan or [(round(float(scale), 4), original)]
+
+
+def _decimate(frames: list, source_fps: int, fps: int) -> list:
+    """Drop frames so a lower playback rate is actually a smaller GIF."""
+    if fps >= source_fps or source_fps < 1:
+        return frames
+    stride = max(1, int(source_fps / fps))
+    chosen = frames[::stride]
+    return chosen or frames[:1]
+
+
+def _under_budget(results: dict, budget: int) -> bool:
+    for info in results.values():
+        if os.path.getsize(info["gif"]) > budget:
+            return False
+    return True
+
+
 def encode(frames_dir: str, fps: int, gif: str, mp4: str | None) -> None:
     pattern = os.path.join(frames_dir, "f%05d.png")
     vf = (
@@ -410,9 +606,7 @@ def encode(frames_dir: str, fps: int, gif: str, mp4: str | None) -> None:
         )
 
 
-def direct(sl: ShotList, outdir: str, scale: float = 0.6) -> dict:
-    os.makedirs(outdir, exist_ok=True)
-    beats = record(sl)
+def _write(sl: ShotList, beats: list, outdir: str, scale: float, fps: int) -> dict:
     subtitle = lead_line(sl)
     results = {}
     for aspect in sl.aspects:
@@ -420,21 +614,43 @@ def direct(sl: ShotList, outdir: str, scale: float = 0.6) -> dict:
         out = (int(width * scale) // 2 * 2, int(height * scale) // 2 * 2)
         tmp = tempfile.mkdtemp()
         try:
-            n = -1
-            for n, frame in enumerate(frames_for(beats, out, title=sl.title, aspect=aspect.value, subtitle=subtitle)):
-                frame.save(os.path.join(tmp, f"f{n:05d}.png"))
-            if n < 0:
+            frames = _decimate(
+                list(frames_for(beats, out, title=sl.title, aspect=aspect.value, subtitle=subtitle)),
+                sl.fps,
+                fps,
+            )
+            if not frames:
                 raise RuntimeError("no frames")
+            for n, frame in enumerate(frames):
+                frame.save(os.path.join(tmp, f"f{n:05d}.png"))
             slug = aspect.value.replace(":", "x")
             gif = os.path.join(outdir, f"demo-{slug}.gif")
             mp4 = os.path.join(outdir, f"demo-{slug}.mp4")
-            encode(tmp, sl.fps, gif, mp4)
-            total = n + 1
-            content = total - TITLE_FRAMES - END_FRAMES
-            still_index = TITLE_FRAMES + max(0, content - 1)
+            encode(tmp, fps, gif, mp4)
+            total = len(frames)
+            content = max(0, total - TITLE_FRAMES - END_FRAMES)
+            still_index = min(total - 1, TITLE_FRAMES + max(0, content - 1))
             still = os.path.join(outdir, f"still-{slug}.png")
             shutil.copy(os.path.join(tmp, f"f{still_index:05d}.png"), still)
-            results[aspect.value] = {"gif": gif, "mp4": mp4, "frames": total, "still": still}
+            results[aspect.value] = {
+                "gif": gif, "mp4": mp4, "frames": total, "still": still,
+                "scale": scale, "fps": fps,
+            }
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+    return results
+
+
+def direct(sl: ShotList, outdir: str, scale: float = 0.6, budget: int | None = None) -> dict:
+    """Record once. When ``budget`` is set, re-encode over-budget GIFs at a lower fps or scale."""
+    os.makedirs(outdir, exist_ok=True)
+    beats = record(sl)
+    plan = fallback_plan(scale, sl.fps) if budget is not None else [(float(scale), int(sl.fps))]
+    results: dict = {}
+    for attempt, (s, fps) in enumerate(plan, start=1):
+        results = _write(sl, beats, outdir, s, fps)
+        for row in results.values():
+            row["attempts"] = attempt
+        if budget is None or _under_budget(results, budget):
+            return results
     return results

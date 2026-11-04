@@ -20,8 +20,16 @@ HELP = """usage: demo-director <shotlist.json> [-o DIR]
        demo-director batch <dir-or-glob> [-o DIR]
        demo-director gallery <dir> [--screenshot FILE]
 
-Synthetic data only. Refuses to render a page that contains an email,
-a phone number, or a configured name."""
+Synthetic data only. Refuses a real-looking email, a phone number, or a
+configured name. example.com, example.org, example.net, .test, and .example
+are allowed. A blank, unstyled, or HTTP error page fails too."""
+
+
+def _failure_payload(exc: RecordingFailure) -> dict:
+    payload = {"status": exc.kind, "step": exc.step_index, "detail": exc.detail}
+    if exc.selector:
+        payload["selector"] = exc.selector
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,7 +55,7 @@ def _init(argv: list[str]) -> int:
     try:
         data = dump_draft(init_source(a.target))
     except RecordingFailure as exc:
-        print(json.dumps({"status": exc.kind, "step": exc.step_index, "detail": exc.detail}))
+        print(json.dumps(_failure_payload(exc)))
         return 1
     except (ShotListError, OSError) as exc:
         print(json.dumps({"status": "error", "detail": str(exc)}))
@@ -103,7 +111,7 @@ def _render(argv: list[str]) -> int:
     try:
         result = direct(sl, a.out, a.scale)
     except RecordingFailure as exc:
-        print(json.dumps({"status": exc.kind, "step": exc.step_index, "detail": exc.detail}))
+        print(json.dumps(_failure_payload(exc)))
         return 1
     print(json.dumps(result, indent=2))
     return 0

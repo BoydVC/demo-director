@@ -377,7 +377,9 @@ class GuardTests(unittest.TestCase):
     def test_empty_canvas_and_flat_body_are_blank(self):
         for rel, detail in (
             ("fixtures/empty-canvas.html", "empty-canvas"),
-            ("fixtures/empty-wall.html", "empty-frames"),
+            ("fixtures/empty-wall.html", "chrome-only"),
+            ("fixtures/chrome-header.html", "chrome-only"),
+            ("fixtures/chrome-gradient.html", "chrome-only"),
         ):
             data = example()
             data["url"] = (ROOT / rel).resolve().as_uri()
@@ -439,7 +441,54 @@ class GuardTests(unittest.TestCase):
         self.assertNotIn("@type", derive_names('{"@type":"Thing"} for the Bot Launcher', title="Bot Launcher"))
         found = locate_denied(("Quinn", "quinn", "@samplebot"), page="Quinn (@samplebot) kept a note", title="Desk")
         self.assertEqual(found, ("Quinn:page", "@samplebot:page"))
+        hidden = locate_denied(("Quinn",), page="Desk notes for Saturday", page_source="Desk notes\nQuinn")
+        self.assertEqual(hidden, ("Quinn:page-source",))
+        revealed = locate_denied(("Quinn",), page="Quinn is on the board", opened="Desk notes for Saturday")
+        self.assertEqual(revealed, ("Quinn:page-click",))
         self.assertEqual(found.count("Quinn:page"), 1)
+        folder = pathlib.Path(tempfile.mkdtemp())
+        hidden = folder / "hidden.html"
+        hidden.write_text(
+            "<title>Desk for Quinn</title>"
+            "<style>body{margin:0;background:#102;color:#eee;font-family:system-ui}"
+            ".grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:16px}"
+            ".card{min-height:160px;color:#fff;padding:16px}</style>"
+            "<h1>Desk</h1><p>Orange cones and green pinnies are ready for Saturday.</p>"
+            "<div class=grid><div class=card style=\"background:#7c2d12\">Cones</div>"
+            "<div class=card style=\"background:#14532d\">Pinnies</div>"
+            "<div class=card style=\"background:#1e3a8a\">Whistle</div></div>"
+        )
+        concealed = example()
+        concealed["title"] = "Desk"
+        concealed["url"] = hidden.resolve().as_uri()
+        concealed["steps"] = [{"action": "hold", "frames": 2}]
+        concealed["aspects"] = ["16:9"]
+        concealed["deny_names"] = ["Quinn"]
+        with self.assertRaises(RecordingFailure) as ctx:
+            direct(parse(concealed), tempfile.mkdtemp(), scale=0.25)
+        self.assertIn("Quinn:page-source", ctx.exception.detail)
+        clicked = folder / "clicked.html"
+        clicked.write_text(
+            "<style>body{margin:0;background:#102;color:#eee;font-family:system-ui}"
+            ".grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:16px}"
+            ".card{min-height:160px;color:#fff;padding:16px}</style>"
+            "<h1>Desk</h1><p>Orange cones and green pinnies are ready for Saturday.</p>"
+            "<button id=show>Show</button><p id=note></p>"
+            "<div class=grid><div class=card style=\"background:#7c2d12\">Cones</div>"
+            "<div class=card style=\"background:#14532d\">Pinnies</div>"
+            "<div class=card style=\"background:#1e3a8a\">Whistle</div></div>"
+            "<script>document.getElementById('show').onclick=()=>{"
+            "document.getElementById('note').textContent='Quinn kept a note';}</script>"
+        )
+        opened = example()
+        opened["title"] = "Desk"
+        opened["url"] = clicked.resolve().as_uri()
+        opened["steps"] = [{"action": "click", "selector": "#show", "frames": 2}]
+        opened["aspects"] = ["16:9"]
+        opened["deny_names"] = ["Quinn"]
+        with self.assertRaises(RecordingFailure) as ctx:
+            direct(parse(opened), tempfile.mkdtemp(), scale=0.25)
+        self.assertIn("Quinn:page-click", ctx.exception.detail)
         folder = pathlib.Path(tempfile.mkdtemp())
         deny = folder / "deny.txt"
         deny.write_text("# synthetic\nQuinn\n@samplebot\n")

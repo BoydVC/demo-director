@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -181,17 +182,34 @@ _LINES_JS = """
 }
 """
 
-_TEXT_JS = """
+_VIEWS_JS = """
 () => {
-  if (!document.body) return "";
-  const parts = [document.body.innerText || ""];
+  const visibleParts = [];
+  if (document.body) visibleParts.push(document.body.innerText || "");
   document.querySelectorAll("input, textarea").forEach((el) => {
-    if (el.value) parts.push(el.value);
-    if (el.placeholder) parts.push(el.placeholder);
+    const style = getComputedStyle(el);
+    const shown = style.display !== "none" && style.visibility !== "hidden" && !el.closest("[hidden]");
+    if (!shown) return;
+    if (el.value) visibleParts.push(el.value);
+    if (el.placeholder) visibleParts.push(el.placeholder);
   });
-  return parts.join("\\n");
+  // The document title is not body text. A match there is source, not on screen.
+  return {visible: visibleParts.join("\\n"), source: document.title || ""};
 }
 """
+
+
+def _page_views(page) -> tuple[str, str]:
+    """Visible on-screen text, then the rest of the document text."""
+    try:
+        raw = page.evaluate(_VIEWS_JS)
+    except Exception:
+        return "", ""
+    if not isinstance(raw, dict):
+        return "", ""
+    visible = raw.get("visible") if isinstance(raw.get("visible"), str) else ""
+    source = raw.get("source") if isinstance(raw.get("source"), str) else ""
+    return visible, source
 
 
 def resolve_fixture(sl: ShotList) -> ShotList:
@@ -224,11 +242,14 @@ def _box(raw) -> Box | None:
 
 
 def _page_text(page) -> str | None:
-    try:
-        text = page.evaluate(_TEXT_JS)
-    except Exception:
-        return None
-    return text if isinstance(text, str) else None
+    visible, source = _page_views(page)
+    if not visible and not source:
+        try:
+            text = page.evaluate("() => document.body ? (document.body.innerText || '') : ''")
+        except Exception:
+            return None
+        return text if isinstance(text, str) else None
+    return visible + "\n" + source
 
 
 def _snap(page) -> Image.Image:
@@ -528,6 +549,128 @@ def _region_flat(image: Image.Image, box: dict) -> bool:
     return _flat_ratio(crop) >= 0.9
 
 
+_CHROME_JS = """
+() => {
+  const vw = window.innerWidth || 1;
+  const vh = window.innerHeight || 1;
+  const shown = (el) => {
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2 && rect.bottom > 0 && rect.right > 0 && rect.top < vh;
+  };
+  const chrome = [];
+  for (const el of document.querySelectorAll("header, nav, footer, [role=banner], [role=navigation], [role=contentinfo]")) {
+    if (!shown(el)) continue;
+    if (el.querySelector("main, [role=main]")) continue;
+    chrome.push(el);
+  }
+  if (document.body) {
+    for (const el of document.body.querySelectorAll("*")) {
+      if (chrome.some((node) => node === el || node.contains(el) || el.contains(node))) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < vw * 0.55 || rect.height < 12 || rect.height > Math.min(160, vh * 0.28)) continue;
+      const style = getComputedStyle(el);
+      const pos = style.position;
+      const topBand = rect.top <= 2 && rect.height <= 88;
+      const pinnedTop = (pos === "fixed" || pos === "sticky") && rect.top <= 4 && rect.bottom < vh * 0.45;
+      const pinnedBottom = (pos === "fixed" || pos === "sticky" || pos === "absolute")
+        && rect.bottom >= vh - 3 && rect.height <= 56 && rect.top > vh * 0.5;
+      if (topBand || pinnedTop || pinnedBottom) chrome.push(el);
+    }
+  }
+  const inside = (el) => chrome.some((node) => node === el || node.contains(el));
+  const parts = [];
+  if (document.body) {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      const text = (textNode.textContent || "").trim();
+      const parent = textNode.parentElement;
+      if (!text || !parent) continue;
+      const tag = parent.tagName;
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
+      if (inside(parent)) continue;
+      parts.push(text);
+    }
+  }
+  let top = 0;
+  let bottom = vh;
+  for (const el of chrome) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < vw * 0.5 || rect.height > vh * 0.5) continue;
+    if (rect.bottom > top && rect.top <= top + 12) top = Math.max(top, Math.min(vh, rect.bottom));
+    if (rect.top < bottom && rect.bottom >= vh - 12) bottom = Math.min(bottom, Math.max(0, rect.top));
+  }
+  const height = Math.max(0, bottom - top);
+  return {
+    text: parts.join("\\n"),
+    box: height >= 8 ? {x: 0, y: top, w: vw, h: height} : null,
+  };
+}
+"""
+
+
+def _ink_ratio(image: Image.Image) -> float:
+    """Share of neighboring pixels with a hard edge.
+
+    A flat field and a smooth gradient stay near 0. Type, controls, and
+    pictures produce edges.
+    """
+    raw = _rgb_bytes(image, (96, 60))
+    width, height = 96, 60
+    ink = 0
+    total = 0
+    for y in range(height):
+        row = y * width
+        for x in range(width - 1):
+            left = (row + x) * 3
+            right = left + 3
+            delta = (
+                abs(raw[left] - raw[right])
+                + abs(raw[left + 1] - raw[right + 1])
+                + abs(raw[left + 2] - raw[right + 2])
+            )
+            total += 1
+            if delta >= 28:
+                ink += 1
+    if total == 0:
+        return 0.0
+    return ink / total
+
+
+def _chrome_only(page, policy: BlankPolicy) -> bool | None:
+    """True when chrome surrounds a main region with no copy and no edges."""
+    try:
+        raw = page.evaluate(_CHROME_JS)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    text = raw.get("text") if isinstance(raw.get("text"), str) else ""
+    meaningful = len(re.sub(r"[^0-9A-Za-z]", "", text))
+    if meaningful >= (policy.min_chars if policy else 48):
+        return False
+    box = raw.get("box")
+    if not isinstance(box, dict):
+        return True
+    shot = _snap(page)
+    crop_box = {
+        "x": box.get("x", 0),
+        "y": box.get("y", 0),
+        "w": box.get("w", shot.width),
+        "h": box.get("h", shot.height),
+    }
+    x = max(0, int(crop_box["x"]))
+    y = max(0, int(crop_box["y"]))
+    w = max(1, int(crop_box["w"]))
+    h = max(1, int(crop_box["h"]))
+    crop = shot.crop((x, y, min(shot.width, x + w), min(shot.height, y + h)))
+    if crop.width < 2 or crop.height < 2:
+        return True
+    return _ink_ratio(crop) < 0.015
+
+
 def _dominant_canvas_blank(page) -> bool | None:
     """True when a canvas covering most of the viewport is a flat empty field."""
     try:
@@ -571,18 +714,22 @@ def record(sl: ShotList) -> list[Beat]:
             except Exception as exc:
                 kind = classify_failure(exc, navigating=True)
                 raise RecordingFailure(kind, -1, "navigation") from exc
-            opening = _page_text(page)
+            visible, source = _page_views(page)
+            opening = (visible + "\n" + source) if (visible or source) else _page_text(page)
             opening_hits = hits(opening, ())
             if opening_hits:
                 blocked = run_step(session, StepSignals(False, True, None, True, False))
                 raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(opening_hits))
-            seen = locate_denied(names, page=opening or "")
+            seen = locate_denied(names, page=visible, page_source=source)
             if seen:
                 raise _name_failure(seen)
+            opened = visible
+            clicked = False
             policy = sl.blank or BlankPolicy()
             refuse_unusable(page, response, policy=policy)
             page.wait_for_timeout(250)
             canvas_flags = [_dominant_canvas_blank(page)]
+            chrome_flags = [_chrome_only(page, policy)]
             for index, step in enumerate(sl.steps):
                 try:
                     session, beat = _drive_step(page, session, step, names, policy)
@@ -593,8 +740,11 @@ def record(sl: ShotList) -> list[Beat]:
                     selector = step_selector(step) or getattr(step, "url", "") or ""
                     detail = session.failure or "no beat"
                     if session.failure == "pii-blocked":
-                        later = _page_text(page) or ""
-                        named = locate_denied(names, page=later)
+                        later_visible, later_source = _page_views(page)
+                        named = locate_denied(
+                            names, page=later_visible, page_source=later_source,
+                            opened=opened if clicked or step.action == "click" else None,
+                        )
                         if named:
                             raise _name_failure(named, index)
                         reasons = hits(later, ())
@@ -609,15 +759,26 @@ def record(sl: ShotList) -> list[Beat]:
                 beats.append(beat)
                 if session.beats != len(beats):
                     raise RecordingFailure("timeout", index, "beat invariant")
-                later = _page_text(page)
-                step_hit = locate_denied(names, page=later or "")
+                if step.action == "click":
+                    clicked = True
+                later_visible, later_source = _page_views(page)
+                step_hit = locate_denied(
+                    names, page=later_visible, page_source=later_source,
+                    opened=opened if clicked else None,
+                )
                 if step_hit:
                     raise _name_failure(step_hit, index)
                 canvas_flags.append(_dominant_canvas_blank(page))
+                chrome_flags.append(_chrome_only(page, policy))
             if canvas_flags and all(flag is True for flag in canvas_flags):
                 raise RecordingFailure(
                     "blank-page", -1, "empty-canvas",
                     warning="page is not demoable: empty-canvas",
+                )
+            if chrome_flags and all(flag is True for flag in chrome_flags):
+                raise RecordingFailure(
+                    "blank-page", -1, "chrome-only",
+                    warning="page is not demoable: chrome-only",
                 )
         finally:
             browser.close()

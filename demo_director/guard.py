@@ -151,12 +151,16 @@ def derived_names(text: str, title: str = "") -> tuple[str, ...]:
     return derive_names(text, title)
 
 
-def locate_denied(terms: Iterable[str], *, page: str = "", title: str = "",
+def locate_denied(terms: Iterable[str], *, page: str = "", page_source: str = "",
+                  opened: str | None = None, title: str = "",
                   captions: Iterable[str] = ()) -> tuple[str, ...]:
-    """One ``term:place`` entry per denied term that is actually rendered.
+    """One ``term:place`` entry per denied term that is actually present.
 
-    ``title`` covers the title card and the end card, which both draw that
-    string. Each term is reported once, with its places joined.
+    ``page`` is text visible on screen. ``page_source`` is the rest of the
+    document (hidden nodes, a closed dialog, the document title). ``opened``
+    is the visible text from the first paint; pass it after a click so a
+    term that was not on screen yet is ``page-click``. ``title`` covers the
+    title card and the end card. Each term is reported once.
     """
     caption_list = [part for part in captions if part]
     found: list[str] = []
@@ -173,8 +177,14 @@ def locate_denied(terms: Iterable[str], *, page: str = "", title: str = "",
             places.append("title")
         if any(term_present(part, token) for part in caption_list):
             places.append("caption")
-        if page and term_present(page, token):
-            places.append("page")
+        visible = bool(page) and term_present(page, token)
+        if visible:
+            if opened is not None and not term_present(opened, token):
+                places.append("page-click")
+            else:
+                places.append("page")
+        elif page_source and term_present(page_source, token):
+            places.append("page-source")
         if not places:
             continue
         seen.add(key)

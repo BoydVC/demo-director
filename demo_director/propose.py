@@ -155,78 +155,27 @@ def headings_in(text: str) -> tuple[str, ...]:
     return tuple(found[:6])
 
 
-# Words a jammed slug token can be split into. A token that is itself a word
-# stays whole, so "kickoff" does not become "kick off".
-_TITLE_WORDS = frozenset({
-    "four", "game", "jam", "star", "ship", "week", "end", "play", "book", "day",
-    "night", "time", "line", "score", "board", "home", "room", "team", "match",
-    "card", "list", "note", "post", "base", "ball", "foot", "back", "yard",
-    "sky", "land", "mark", "book", "mark", "control", "mission", "demo",
-    "director", "planner", "weekend", "keyboard", "kickoff", "basketball",
-    "maryland", "synthetic", "saturday", "session", "locker", "practice",
-    "player", "archive", "roster", "check", "field", "court", "orange", "cones",
-    "ready", "today", "atlas", "galaxy", "fleet", "year", "wall", "blue",
-    "since", "boyhood", "hot", "stove", "film", "gameday", "preview",
-})
-
-
-def _segment_token(token: str) -> list[str]:
-    """Split ``gamejam`` into ``game`` + ``jam``. A real word stays one piece."""
-    lower = token.casefold()
-    if not lower.isalpha():
-        return [token]
-    if lower in _TITLE_WORDS:
-        return [lower]
-    n = len(lower)
-    best: list[list[str] | None] = [None] * (n + 1)
-    best[0] = []
-    for i in range(n):
-        if best[i] is None:
-            continue
-        for j in range(i + 3, n + 1):
-            piece = lower[i:j]
-            if piece not in _TITLE_WORDS:
-                continue
-            cand = best[i] + [piece]
-            if best[j] is None or len(cand) < len(best[j]):
-                best[j] = cand
-    if best[n] is None or len(best[n]) < 2:
-        return [lower]
-    return best[n]
-
-
 def human_title(slug: str) -> str:
-    """``four-game-jam`` and ``FOUR-GAMEJAM`` become ``Four Game Jam``."""
-    words: list[str] = []
-    for part in re.split(r"[-_\s]+", (slug or "").strip()):
-        if not part:
-            continue
-        words.extend(_segment_token(part))
-    return " ".join(word[:1].upper() + word[1:].lower() for word in words)
+    """Title-case a repo slug, splitting only on hyphens and underscores.
 
-
-def _letters(text: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (text or "").casefold())
+    ``four-game-jam`` becomes ``Four Game Jam``. A compound word with no
+    separator stays whole, so a slug token is never cut with a word list.
+    """
+    parts = [part for part in re.split(r"[-_]+", (slug or "").strip()) if part]
+    titled = " ".join(part[:1].upper() + part[1:].lower() for part in parts)
+    return titled or "Demo"
 
 
 def display_title(page_title: str, slug: str = "") -> str:
-    """Prefer a spaced title over a repo slug or a jammed heading.
+    """Use a page heading verbatim. The repo slug is only the fallback.
 
-    ``four-game-jam``, ``FOUR-GAMEJAM``, and ``Four Gamejam`` are all
-    ``Four Game Jam``. A real heading such as ``Weekend Planner`` is kept.
+    An ``h1`` or document title such as ``Starship Tower`` is kept as written.
+    ``four-game-jam`` is spaced only when that slug is the title we have.
     """
     raw = " ".join((page_title or "").split())
     pretty = human_title(slug) if slug else ""
-    if not raw:
+    if not raw or raw.casefold() in {"demo", "index.html", "index.htm"}:
         return pretty or "Demo"
-    if pretty and _letters(raw) == _letters(slug):
-        return pretty
-    tidied = human_title(raw)
-    inserted = len(tidied.split()) > len(re.split(r"[-_\s]+", raw))
-    slug_like = bool(re.fullmatch(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+", raw))
-    shouted = raw.replace("-", "").replace("_", "").replace(" ", "").isupper()
-    if inserted or slug_like or shouted:
-        return tidied or raw
     return raw
 
 

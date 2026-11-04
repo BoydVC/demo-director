@@ -7,7 +7,13 @@ in this script. After a render reports ok, the page is replayed the way a
 leak check would: title, captions, visible text, and click steps. A denied
 term there is ``name-leak``, not ok.
 
-Writes a JSON summary with one row per repo: ok, name-blocked, blank, other.
+Each repo is written to ``<workdir>/status/<repo>.json``. The summary counts
+are the bucket tally of those files in set-file order, so a second read of
+the same files reproduces the counts. ``build.py`` is run when present,
+which fills pages that are still templates; a runner that serves the
+template instead will count those repos as blank rather than ok or
+name-blocked. A page whose copy is filled from data that is not in the
+checkout can also disagree.
 """
 from __future__ import annotations
 
@@ -299,14 +305,38 @@ def main(argv: list[str] | None = None) -> int:
     pending = [(repo, group, index) for index, (repo, group) in enumerate(rows) if repo not in done]
     results = list(done.values())
 
+    status_dir = args.workdir / "status"
+    status_dir.mkdir(parents=True, exist_ok=True)
+
     def store() -> None:
         ordered = {item["repo"]: item for item in results}
-        repos = [ordered[repo] for repo, _group in rows if repo in ordered]
+        for repo, group in rows:
+            item = ordered.get(repo)
+            if not item:
+                continue
+            clean = {
+                "bucket": item.get("bucket") or _bucket(str(item.get("status") or ""), str(item.get("detail") or "")),
+                "detail": item.get("detail") or "",
+                "group": item.get("group") or group,
+                "repo": repo,
+                "status": item.get("status") or "",
+                "title": item.get("title") or "",
+            }
+            (status_dir / f"{repo}.json").write_text(json.dumps(clean, indent=2, sort_keys=True) + "\n")
+        loaded = []
+        for repo, _group in rows:
+            path = status_dir / f"{repo}.json"
+            if path.is_file():
+                loaded.append(json.loads(path.read_text()))
         counts: dict[str, int] = {}
-        for item in repos:
-            counts[item["bucket"]] = counts.get(item["bucket"], 0) + 1
+        for item in loaded:
+            bucket = str(item.get("bucket") or "other")
+            counts[bucket] = counts.get(bucket, 0) + 1
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps({"counts": counts, "repos": repos}, indent=2) + "\n")
+        args.out.write_text(json.dumps(
+            {"counts": counts, "repos": loaded, "status_dir": str(status_dir)},
+            indent=2, sort_keys=True,
+        ) + "\n")
 
     if not pending:
         store()

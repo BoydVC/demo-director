@@ -14,6 +14,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from .guard import hits, names_to_block
+from .types import PiiPolicy
 from .session import RecordingFailure
 from .shotlist import FIXTURE_URL, dump
 from .types import (
@@ -155,10 +156,54 @@ def headings_in(text: str) -> tuple[str, ...]:
     return tuple(found[:6])
 
 
+# Words a jammed slug token can be split into. A token that is itself a word
+# stays whole, so "kickoff" does not become "kick off".
+_TITLE_WORDS = frozenset({
+    "four", "game", "jam", "star", "ship", "week", "end", "play", "book", "day",
+    "night", "time", "line", "score", "board", "home", "room", "team", "match",
+    "card", "list", "note", "post", "base", "ball", "foot", "back", "yard",
+    "sky", "land", "mark", "book", "mark", "control", "mission", "demo",
+    "director", "planner", "weekend", "keyboard", "kickoff", "basketball",
+    "maryland", "synthetic", "saturday", "session", "locker", "practice",
+    "player", "archive", "roster", "check", "field", "court", "orange", "cones",
+    "ready", "today", "atlas", "galaxy", "fleet", "year", "wall", "blue",
+    "since", "boyhood", "hot", "stove", "film", "gameday", "preview",
+})
+
+
+def _segment_token(token: str) -> list[str]:
+    """Split ``gamejam`` into ``game`` + ``jam``. A real word stays one piece."""
+    lower = token.casefold()
+    if not lower.isalpha():
+        return [token]
+    if lower in _TITLE_WORDS:
+        return [lower]
+    n = len(lower)
+    best: list[list[str] | None] = [None] * (n + 1)
+    best[0] = []
+    for i in range(n):
+        if best[i] is None:
+            continue
+        for j in range(i + 3, n + 1):
+            piece = lower[i:j]
+            if piece not in _TITLE_WORDS:
+                continue
+            cand = best[i] + [piece]
+            if best[j] is None or len(cand) < len(best[j]):
+                best[j] = cand
+    if best[n] is None or len(best[n]) < 2:
+        return [lower]
+    return best[n]
+
+
 def human_title(slug: str) -> str:
-    """``four-game-jam`` and ``FOUR-GAME-JAM`` become ``Four Game Jam``."""
-    parts = [part for part in re.split(r"[-_\s]+", (slug or "").strip()) if part]
-    return " ".join(part[:1].upper() + part[1:].lower() for part in parts)
+    """``four-game-jam`` and ``FOUR-GAMEJAM`` become ``Four Game Jam``."""
+    words: list[str] = []
+    for part in re.split(r"[-_\s]+", (slug or "").strip()):
+        if not part:
+            continue
+        words.extend(_segment_token(part))
+    return " ".join(word[:1].upper() + word[1:].lower() for word in words)
 
 
 def _letters(text: str) -> str:
@@ -166,21 +211,23 @@ def _letters(text: str) -> str:
 
 
 def display_title(page_title: str, slug: str = "") -> str:
-    """Prefer a spaced title over a repo slug or a jammed all-caps heading.
+    """Prefer a spaced title over a repo slug or a jammed heading.
 
-    ``FOUR-GAMEJAM`` from the folder ``four-game-jam`` is ``Four Game Jam``.
-    A real heading such as ``Weekend Planner`` is left as written.
+    ``four-game-jam``, ``FOUR-GAMEJAM``, and ``Four Gamejam`` are all
+    ``Four Game Jam``. A real heading such as ``Weekend Planner`` is kept.
     """
     raw = " ".join((page_title or "").split())
     pretty = human_title(slug) if slug else ""
     if not raw:
         return pretty or "Demo"
-    slug_like = bool(re.fullmatch(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+", raw))
-    same = bool(pretty) and _letters(raw) == _letters(slug)
-    if same and pretty:
+    if pretty and _letters(raw) == _letters(slug):
         return pretty
-    if slug_like:
-        return human_title(raw)
+    tidied = human_title(raw)
+    inserted = len(tidied.split()) > len(re.split(r"[-_\s]+", raw))
+    slug_like = bool(re.fullmatch(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+", raw))
+    shouted = raw.replace("-", "").replace("_", "").replace(" ", "").isupper()
+    if inserted or slug_like or shouted:
+        return tidied or raw
     return raw
 
 
@@ -218,16 +265,9 @@ def readme_near(start: pathlib.Path) -> str:
     return ""
 
 
-def _block_derived(chunks: list[str], allow: tuple[str, ...] = ()) -> None:
-    blocked = names_to_block("\n".join(chunks), allow)
-    if not blocked:
-        return
-    raise RecordingFailure(
-        "pii-blocked",
-        -1,
-        "name",
-        warning="derived-name: " + ", ".join(blocked),
-    )
+def _watch_from(chunks: list[str], allow: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """README and title terms. They block later, only if a render shows them."""
+    return names_to_block("\n".join(chunks), allow)
 
 
 def public_text(text: str, fallback: str) -> str:
@@ -325,7 +365,8 @@ def _refuse(text: object) -> None:
 
 
 def draft_from(title: str, url: str, headings: tuple[str, ...] | list[str],
-               page: PageControls | None, results: tuple[str, ...] = ()) -> Draft:
+               page: PageControls | None, results: tuple[str, ...] = (),
+               watch: tuple[str, ...] = ()) -> Draft:
     steps = []
     notes: list[SourceNote] = []
 
@@ -359,6 +400,7 @@ def draft_from(title: str, url: str, headings: tuple[str, ...] | list[str],
         url=url,
         steps=tuple(steps),
         aspects=(Aspect.WIDE, Aspect.SQUARE, Aspect.TALL),
+        pii=PiiPolicy(watch=tuple(watch)),
     )
     return Draft(shot, tuple(notes))
 
@@ -465,8 +507,8 @@ def from_page(url: str, fallback: str = "Demo", slug: str = "",
     local = pathlib.Path(urlparse(url).path) if url.startswith("file:") else None
     readme = readme_near(local) if local is not None else ""
     chosen = display_title(page.title or fallback, slug or fallback)
-    _block_derived([readme, page.title, text, chosen], allow_names)
-    return draft_from(chosen, _portable(url), (), page, results)
+    watch = _watch_from([readme, page.title, chosen], allow_names)
+    return draft_from(chosen, _portable(url), (), page, results, watch)
 
 
 def from_readme(path: pathlib.Path, slug: str = "", allow_names: tuple[str, ...] = ()) -> Draft:
@@ -481,15 +523,15 @@ def from_readme(path: pathlib.Path, slug: str = "", allow_names: tuple[str, ...]
         if not headings:
             raise ShotListError(f"no headings in {path}")
         title = display_title(headings[0], slug)
-        _block_derived([text, title], allow_names)
-        return draft_from(title, FIXTURE_URL, (title, *headings[1:]), None)
+        watch = _watch_from([text, title], allow_names)
+        return draft_from(title, FIXTURE_URL, (title, *headings[1:]), None, watch=watch)
     page, results, page_text = probe(url)
     _refuse(page_text)
     raw = headings[0] if headings else page.title
     title = display_title(raw, slug or path.parent.name)
-    _block_derived([text, page.title, page_text, title], allow_names)
+    watch = _watch_from([text, page.title, title], allow_names)
     shown = (title, *headings[1:]) if headings else ()
-    return draft_from(title, _portable(url), shown, page, results)
+    return draft_from(title, _portable(url), shown, page, results, watch)
 
 
 def init_source(source: str, allow_names: tuple[str, ...] = ()) -> Draft:

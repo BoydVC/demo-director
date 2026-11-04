@@ -134,6 +134,8 @@ class InitTests(unittest.TestCase):
     def test_slug_becomes_a_spaced_title(self):
         self.assertEqual(human_title("four-game-jam"), "Four Game Jam")
         self.assertEqual(display_title("FOUR-GAMEJAM", "four-game-jam"), "Four Game Jam")
+        self.assertEqual(display_title("FOUR-GAMEJAM", ""), "Four Game Jam")
+        self.assertEqual(display_title("Four Gamejam", ""), "Four Game Jam")
         self.assertEqual(display_title("FOUR-GAME-JAM", ""), "Four Game Jam")
         self.assertEqual(display_title("Weekend Planner", "demo-director"), "Weekend Planner")
         folder = pathlib.Path(tempfile.mkdtemp()) / "four-game-jam"

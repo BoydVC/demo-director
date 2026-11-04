@@ -37,48 +37,172 @@ _PHONE = re.compile(
 )
 
 
-# Given names implied by "Alex's" or "for Alex Example". Short tokens and
-# ordinary title words stay out so "Men's" and "Saturday session" do not block.
-_POSSESSIVE = re.compile(r"\b([A-Z][a-z]{3,})'s\b")
-_FOR_PERSON = re.compile(r"\bfor ([A-Z][a-z]{3,}) ([A-Z][a-z]{3,})\b")
-_NAME_STOP = frozenset({
-    "today", "tonight", "saturday", "sunday", "monday", "tuesday", "wednesday",
-    "thursday", "friday", "weekend", "team", "demo", "user", "home", "game",
+# Watch terms, not an automatic block. A README can mention a person; the
+# render blocks only when that term shows up in the page or a caption.
+_POSSESSIVE = re.compile(r"\b([A-Z][a-z]{2,})'s\b")
+_PAIR = re.compile(r"\b([A-Z][a-z]{2,}) ([A-Z][a-z]{2,})\b")
+_HANDLE = re.compile(r"(?<![\w])@([A-Za-z][A-Za-z0-9_]{2,})")
+# Common words and places. "Earth's", "What's", "Reader's", "Oriole Park" are not people.
+_NOT_PERSON = frozenset({
+    "today", "tonight", "tomorrow", "saturday", "sunday", "monday", "tuesday",
+    "wednesday", "thursday", "friday", "weekend", "week", "year", "month", "time",
+    "day", "night", "morning", "evening", "team", "demo", "user", "home", "game",
     "board", "room", "click", "page", "error", "loading", "synthetic", "planner",
-    "check", "player", "locker", "keyboard", "practice", "session", "match",
-    "night", "stats", "item", "field", "time", "year", "week", "coach", "club",
-    "city", "park", "sample", "example", "test", "app", "data", "only",
+    "check", "kit", "player", "locker", "keyboard", "kickoff", "practice", "session",
+    "match", "stats", "item", "field", "coach", "club", "sample", "example",
+    "test", "app", "data", "only", "what", "when", "where", "which", "who",
+    "whose", "whom", "how", "why", "this", "that", "these", "those", "there",
+    "here", "your", "their", "ours", "they", "them", "then", "than", "earth",
+    "world", "reader", "group", "island", "path", "life", "love", "best", "new",
+    "old", "first", "last", "next", "every", "each", "all", "some", "many",
+    "more", "most", "other", "such", "into", "from", "with", "have", "been",
+    "were", "will", "just", "like", "make", "made", "over", "after", "before",
+    "about", "again", "still", "also", "back", "down", "left", "right", "open",
+    "close", "start", "stop", "play", "goal", "ball", "score", "court", "season",
+    "round", "final", "super", "grand", "main", "side", "full", "half", "high",
+    "long", "short", "small", "large", "great", "little", "public", "local",
+    "total", "whole", "ready", "orange", "cones", "today", "archive", "times",
+    "roster", "badge", "drill", "timeline", "standing", "standings", "control",
+    "mission", "atlas", "bookmark", "galaxy", "constellation", "author", "card",
+    "cards", "note", "notes", "list", "lists", "map", "chart", "graph", "code",
+    "site", "blog", "post", "feed", "news", "story", "photo", "image", "video",
+    "audio", "music", "song", "show", "film", "movie", "sport", "sports",
+    "men", "women", "kids", "folks", "people",
+    "maryland", "basketball", "weekend", "director", "synthetic", "saturday",
+    "keyboard", "practice", "locker", "player", "session", "planner", "check",
+    "chelsea", "oriole", "orioles", "brooklyn", "london", "paris", "york",
+    "baltimore", "annapolis", "manhattan", "harlem", "mars", "venus", "jupiter",
+    "saturn", "moon", "star", "stars", "land", "sky", "sun", "park", "city",
+    "bay", "river", "hill", "lake", "mountain", "street", "road", "county",
+    "stadium", "arena", "garden", "harbor", "harbour", "beach", "valley",
+    "creek", "ridge", "heights", "square", "plaza", "bridge", "port", "coast",
+    "shore", "point", "falls", "springs", "woods", "forest", "desert", "ocean",
+    "sea", "gulf", "isle", "mount", "fort", "village", "town", "district",
+    "yard", "dome", "grounds", "pitch", "range", "course", "track", "pool",
+    "rink", "gym", "school", "college", "university", "library", "museum",
+    "market", "center", "centre", "station", "airport", "tower", "building",
+    "house", "hall", "palace", "castle", "gate", "wall", "avenue", "lane",
+    "drive", "place", "trail", "north", "south", "east", "west", "central",
+    "upper", "lower", "inner", "outer", "royal", "national", "state", "united",
+    "american", "group", "path", "reader", "earth", "island", "what",
+})
+_GENERIC_HANDLES = frozenset({
+    "demo", "example", "test", "synthetic", "user", "admin", "guest", "team", "bot", "sample",
 })
 
 
-def derived_names(text: str) -> tuple[str, ...]:
-    """Names a README or title gives away: a possessive, or 'for First Last'."""
+def _person_token(word: str) -> bool:
+    token = word.casefold()
+    return len(token) >= 3 and token not in _NOT_PERSON
+
+
+def _place_word(word: str) -> bool:
+    return word.casefold() in _NOT_PERSON and word.casefold() in {
+        "park", "island", "city", "bay", "river", "hill", "lake", "mountain",
+        "street", "road", "county", "stadium", "arena", "garden", "harbor",
+        "harbour", "beach", "valley", "creek", "ridge", "heights", "square",
+        "plaza", "bridge", "port", "coast", "shore", "point", "falls", "springs",
+        "woods", "forest", "desert", "ocean", "sea", "gulf", "isle", "mount",
+        "fort", "village", "town", "district", "yard", "dome", "grounds", "pitch",
+        "court", "field", "range", "course", "track", "center", "centre",
+        "station", "tower", "hall", "house", "place", "chelsea", "york",
+        "brooklyn", "london", "paris", "baltimore", "annapolis", "maryland",
+        "oriole", "orioles",
+    }
+
+
+def watch_terms(text: str) -> tuple[str, ...]:
+    """Person-like terms and @handles in a README or title. Not a block by itself.
+
+    Places and ordinary words are ignored. A ``First Last`` match also watches
+    the surname. ``--deny-name`` does not go through this filter.
+    """
     if not isinstance(text, str) or not text:
         return ()
     found: list[str] = []
 
     def add(name: str) -> None:
         cleaned = " ".join(name.split())
-        if not cleaned or cleaned.casefold() in _NAME_STOP:
+        if not cleaned or cleaned in found:
             return
-        if cleaned not in found:
-            found.append(cleaned)
+        found.append(cleaned)
 
+    for match in _HANDLE.finditer(text):
+        handle = match.group(1)
+        if handle.casefold() in _GENERIC_HANDLES:
+            continue
+        add("@" + handle)
     for match in _POSSESSIVE.finditer(text):
-        add(match.group(1))
-    for match in _FOR_PERSON.finditer(text):
+        word = match.group(1)
+        if _person_token(word):
+            add(word)
+    for match in _PAIR.finditer(text):
         first, last = match.group(1), match.group(2)
-        if first.casefold() in _NAME_STOP:
+        if not _person_token(first) or not _person_token(last):
+            continue
+        if _place_word(last) or _place_word(first):
             continue
         add(f"{first} {last}")
         add(first)
+        add(last)
     return tuple(found)
 
 
+def derived_names(text: str) -> tuple[str, ...]:
+    """Watch terms a README or title gives away. Seeing one is not yet a block."""
+    return watch_terms(text)
+
+
 def names_to_block(text: str, allow: Iterable[str] = ()) -> tuple[str, ...]:
-    """Derived names that are not on the allowlist. Empty means render may proceed."""
+    """Watch terms left after the allowlist. The caller still has to see them rendered."""
     allowed = {part.casefold() for part in allow if isinstance(part, str)}
-    return tuple(name for name in derived_names(text) if name.casefold() not in allowed)
+    return tuple(name for name in watch_terms(text) if name.casefold() not in allowed)
+
+
+def _contains_term(term: str, text: str) -> bool:
+    if not term or not text:
+        return False
+    if term.startswith("@"):
+        return term.casefold() in text.casefold()
+    return re.search(rf"(?<![\w]){re.escape(term)}(?![\w])", text, re.IGNORECASE) is not None
+
+
+def matched_terms(terms: Iterable[str], *, page: str = "", title: str = "",
+                  captions: Iterable[str] = ()) -> tuple[str, ...]:
+    """``term:where`` for watch or deny terms that actually appear.
+
+    ``where`` is page, caption, or title. A term that is only in a README is
+    not listed. Explicit deny names use the same locator and stay strict:
+    they are not dropped for being common words.
+    """
+    caption_text = "\n".join(part for part in captions if part)
+    found: list[str] = []
+    for term in terms:
+        if not isinstance(term, str) or not term.strip():
+            continue
+        token = " ".join(term.split())
+        if _contains_term(token, page):
+            found.append(f"{token}:page")
+        elif _contains_term(token, caption_text):
+            found.append(f"{token}:caption")
+        elif _contains_term(token, title):
+            found.append(f"{token}:title")
+    return tuple(found)
+
+
+def page_handles(text: str) -> tuple[str, ...]:
+    """Non-generic @handles written on a page or caption. They are already seen."""
+    if not isinstance(text, str) or not text:
+        return ()
+    found: list[str] = []
+    for match in _HANDLE.finditer(text):
+        handle = match.group(1)
+        if handle.casefold() in _GENERIC_HANDLES:
+            continue
+        token = "@" + handle
+        if token not in found:
+            found.append(token)
+    return tuple(found)
 
 
 def _reserved_email(address: str) -> bool:

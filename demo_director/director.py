@@ -19,7 +19,7 @@ from pathlib import Path
 from PIL import Image
 
 from . import compose
-from .guard import hits, names_to_block
+from .guard import hits, matched_terms, page_handles
 from .session import Phase, RecordingFailure, Session, StepSignals, run_step
 from .shotlist import ASPECTS, FIXTURE_URL
 from .types import Beat, BlankPolicy, Box, ShotList, step_selector, step_text
@@ -308,7 +308,39 @@ _PAGE_STATE_JS = """
       break;
     }
   }
-  return {text, styled};
+  const prominent = [...document.querySelectorAll("h1,h2,[role=alert],[role=status]")]
+    .map((el) => (el.innerText || "").trim()).filter(Boolean).join("\\n");
+  function canvasBlank(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width < 280 || rect.height < 180) return false;
+    const w = canvas.width || 0;
+    const h = canvas.height || 0;
+    if (w < 2 || h < 2) return false;
+    let ctx = null;
+    try { ctx = canvas.getContext("2d"); } catch (e) { ctx = null; }
+    if (!ctx) return false;
+    let data;
+    try {
+      data = ctx.getImageData(0, 0, Math.min(w, 48), Math.min(h, 48)).data;
+    } catch (e) {
+      return false;
+    }
+    let min = 255;
+    let max = 0;
+    let painted = 0;
+    for (let i = 0; i < data.length; i += 16) {
+      const alpha = data[i + 3];
+      const lum = data[i] + data[i + 1] + data[i + 2];
+      if (alpha < 8) continue;
+      painted += 1;
+      if (lum < min) min = lum;
+      if (lum > max) max = lum;
+    }
+    if (painted < 4) return true;
+    return max - min < 18;
+  }
+  const emptyCanvas = [...document.querySelectorAll("canvas")].some(canvasBlank);
+  return {text, styled, prominent, emptyCanvas};
 }
 """
 
@@ -335,9 +367,12 @@ def page_problem(page, response, policy: BlankPolicy | None = None) -> str | Non
     text = raw.get("text") if isinstance(raw.get("text"), str) else ""
     if not raw.get("styled"):
         return "unstyled"
+    if raw.get("emptyCanvas"):
+        return "empty-canvas"
     if not text.strip():
         return "no-visible-text"
-    return rules.reason(text)
+    prominent = raw.get("prominent") if isinstance(raw.get("prominent"), str) else ""
+    return rules.reason(text, prominent)
 
 
 def refuse_unusable(page, response, step_index: int = -1, policy: BlankPolicy | None = None) -> None:
@@ -478,17 +513,37 @@ def _drive_step(page, session: Session, step, names: tuple[str, ...],
     return final, Beat(before, after, box, step, label, lines)
 
 
+def _name_failure(parts: tuple[str, ...] | list[str]) -> RecordingFailure:
+    detail = "name:" + ",".join(parts)
+    return RecordingFailure("pii-blocked", -1, detail, warning=detail)
+
+
+def _caption_texts(sl: ShotList) -> list[str]:
+    return [text for step in sl.steps if (text := step_text(step)) and step.action == "caption"]
+
+
 def record(sl: ShotList) -> list[Beat]:
     """Walk the shot list. Raises RecordingFailure instead of returning a partial take."""
     from playwright.sync_api import sync_playwright
 
     sl = resolve_fixture(sl)
     names = sl.pii.names
+    allow = {part.casefold() for part in sl.pii.allow}
+    watch = tuple(term for term in sl.pii.watch if term.casefold() not in allow)
+    captions = _caption_texts(sl)
     session = Session.idle()
-    blob = hits(shotlist_blob(sl), names)
+    blob = hits(shotlist_blob(sl), ())
     if blob:
         blocked = run_step(session, StepSignals(False, True, None, True, False))
         raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(blob))
+    # Strict deny names are not filtered as common words. Watch terms from a
+    # README block only when the rendered title, a caption, or the page shows them.
+    strict_before = matched_terms(names, title=sl.title, captions=captions)
+    watch_before = matched_terms(watch, title=sl.title, captions=captions)
+    handle_before = tuple(f"{handle}:caption" for handle in page_handles("\n".join(captions) + "\n" + sl.title))
+    named = strict_before + watch_before + handle_before
+    if named:
+        raise _name_failure(named)
 
     beats: list[Beat] = []
     with sync_playwright() as p:
@@ -501,16 +556,14 @@ def record(sl: ShotList) -> list[Beat]:
                 kind = classify_failure(exc, navigating=True)
                 raise RecordingFailure(kind, -1, "navigation") from exc
             opening = _page_text(page)
-            derived = names_to_block(sl.title + "\n" + (opening or ""), sl.pii.allow)
-            if derived:
-                raise RecordingFailure(
-                    "pii-blocked", -1, "name",
-                    warning="derived-name: " + ", ".join(derived),
-                )
-            opening_hits = hits(opening, names)
+            opening_hits = hits(opening, ())
             if opening_hits:
                 blocked = run_step(session, StepSignals(False, True, None, True, False))
                 raise RecordingFailure(blocked.failure or "pii-blocked", -1, ",".join(opening_hits))
+            seen = matched_terms(tuple(names) + watch, page=opening or "")
+            seen += tuple(f"{handle}:page" for handle in page_handles(opening or ""))
+            if seen:
+                raise _name_failure(seen)
             policy = sl.blank or BlankPolicy()
             refuse_unusable(page, response, policy=policy)
             for index, step in enumerate(sl.steps):
@@ -719,10 +772,52 @@ def _write(sl: ShotList, beats: list, outdir: str, scale: float, fps: int) -> di
     return results
 
 
+def _rgb_bytes(image: Image.Image, size: tuple[int, int]) -> bytes:
+    return image.convert("RGB").resize(size).tobytes()
+
+
+def _flat_ratio(image: Image.Image) -> float:
+    """Share of pixels that fall in the single most common coarse color."""
+    raw = _rgb_bytes(image, (80, 50))
+    buckets: dict[tuple[int, int, int], int] = {}
+    count = len(raw) // 3
+    for index in range(0, len(raw), 3):
+        key = (raw[index] // 24, raw[index + 1] // 24, raw[index + 2] // 24)
+        buckets[key] = buckets.get(key, 0) + 1
+    return max(buckets.values()) / count
+
+
+def _mean_delta(left: Image.Image, right: Image.Image) -> float:
+    a = _rgb_bytes(left, (64, 40))
+    b = _rgb_bytes(right, (64, 40))
+    total = sum(abs(one - two) for one, two in zip(a, b))
+    return total / len(a)
+
+
+def _empty_body(beats: list[Beat]) -> str | None:
+    """Body frames that never change and are almost one flat color.
+
+    Title and end cards are not part of the beats. A rich page that sits
+    still is not flat, so a hold on a real screen still renders.
+    """
+    shots = [beat.before for beat in beats] + [beat.after for beat in beats]
+    shots = [shot for shot in shots if shot is not None]
+    if len(shots) < 2:
+        return None
+    if not _flat_ratio(shots[0]) >= 0.82:
+        return None
+    if any(_mean_delta(shots[0], shot) >= 8 for shot in shots[1:]):
+        return None
+    return "empty-frames"
+
+
 def direct(sl: ShotList, outdir: str, scale: float = 0.6, budget: int | None = None) -> dict:
     """Record once. When ``budget`` is set, re-encode over-budget GIFs at a lower fps or scale."""
     os.makedirs(outdir, exist_ok=True)
     beats = record(sl)
+    empty = _empty_body(beats)
+    if empty:
+        raise RecordingFailure("blank-page", -1, empty, warning=f"page is not demoable: {empty}")
     plan = fallback_plan(scale, sl.fps) if budget is not None else [(float(scale), int(sl.fps))]
     results: dict = {}
     for attempt, (s, fps) in enumerate(plan, start=1):

@@ -85,18 +85,13 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
         item["error"] = str(exc)
         return item
     allow = tuple(allow_names)
-    sl = replace(sl, pii=PiiPolicy(names=tuple(sl.pii.names) + tuple(extra_names), allow=tuple(sl.pii.allow) + allow))
+    watch = names_to_block(readme_near(pathlib.Path(path).parent) + "\n" + sl.title, allow)
+    sl = replace(sl, pii=PiiPolicy(
+        names=tuple(sl.pii.names) + tuple(extra_names),
+        allow=tuple(sl.pii.allow) + allow,
+        watch=tuple(sl.pii.watch) + watch,
+    ))
     item["title"] = sl.title
-    derived = names_to_block(readme_near(pathlib.Path(path).parent) + "\n" + sl.title, allow)
-    if derived:
-        exc = RecordingFailure("pii-blocked", -1, "name", warning="derived-name: " + ", ".join(derived))
-        item["status"] = exc.kind
-        item["kind"] = exc.kind
-        item["step"] = exc.step_index
-        item["selector"] = None
-        item["warning"] = exc.warning
-        item["error"] = failure_summary(exc)
-        return item
     try:
         rendered = direct(sl, outdir, scale, budget)
     except RecordingFailure as exc:

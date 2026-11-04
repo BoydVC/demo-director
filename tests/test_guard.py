@@ -137,10 +137,15 @@ class GuardTests(unittest.TestCase):
         folder = pathlib.Path(tempfile.mkdtemp())
         page = folder / "salon.html"
         page.write_text(
-            "<style>body{font-family:system-ui;background:#102;color:#eee;padding:24px}</style>"
-            "<h1>Salon desk</h1>"
-            "<p>Synthetic schedule for a Saturday session with orange cones ready today.</p>"
-            "<p>Booked as desk.demo@example.com</p>"
+            "<style>body{margin:0;background:#102;color:#eee;font-family:system-ui}"
+            "header{padding:16px 24px;background:#1e293b} .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:16px}"
+            ".card{min-height:180px;border-radius:12px;padding:16px;color:#fff}"
+            "</style><header><h1>Salon desk</h1></header>"
+            "<p style=\"padding:0 24px\">Synthetic schedule for a Saturday session with orange cones ready today. "
+            "Booked as desk.demo@example.com</p>"
+            "<div class=grid><div class=card style=\"background:#7c2d12\">Cones</div>"
+            "<div class=card style=\"background:#14532d\">Pinnies</div>"
+            "<div class=card style=\"background:#1e3a8a\">Whistle</div></div>"
         )
         data = example()
         data["url"] = page.resolve().as_uri()
@@ -319,45 +324,116 @@ class GuardTests(unittest.TestCase):
         page = "Synthetic schedule for a Saturday session with orange cones ready today."
         self.assertIsNone(BlankPolicy().reason(page))
         self.assertEqual(BlankPolicy(min_chars=500).reason(page), "sparse-text")
-        self.assertEqual(
-            BlankPolicy(patterns=(r"orange cones",)).reason(page),
-            "error-phrase:orange cones",
-        )
+        self.assertEqual(BlankPolicy(patterns=(r"orange cones",)).reason("orange cones"), "error-phrase:orange cones")
+        self.assertIsNone(BlankPolicy(patterns=(r"orange cones",)).reason(page))
         data = example()
-        data["url"] = (ROOT / "fixtures" / "blank-sparse.html").resolve().as_uri()
+        data["url"] = (ROOT / "fixtures" / "mention-error.html").resolve().as_uri()
         data["steps"] = [{"action": "hold", "frames": 2}]
         data["aspects"] = ["16:9"]
-        data["blank"] = {"min_chars": 1, "patterns": []}
-        out = tempfile.mkdtemp()
-        direct(parse(data), out, scale=0.3)
-        self.assertTrue(list(pathlib.Path(out).glob("demo-*.gif")))
+        data["blank"] = {"min_chars": 10000, "patterns": []}
+        with self.assertRaises(RecordingFailure) as ctx:
+            direct(parse(data), tempfile.mkdtemp(), scale=0.3)
+        self.assertEqual(ctx.exception.detail, "sparse-text")
+
+    def test_phrase_dominates_or_a_full_page_renders(self):
+        full_error = example()
+        full_error["url"] = (ROOT / "fixtures" / "mention-error.html").resolve().as_uri()
+        full_error["title"] = "Error handling guide"
+        full_error["steps"] = [{"action": "hold", "frames": 2}]
+        full_error["aspects"] = ["16:9"]
+        full_empty = example()
+        full_empty["url"] = (ROOT / "fixtures" / "mention-empty.html").resolve().as_uri()
+        full_empty["title"] = "Saturday scoreboard"
+        full_empty["steps"] = [{"action": "hold", "frames": 2}]
+        full_empty["aspects"] = ["16:9"]
+        only = example()
+        only["url"] = (ROOT / "fixtures" / "only-failed.html").resolve().as_uri()
+        only["title"] = "Failed"
+        only["steps"] = [{"action": "hold", "frames": 2}]
+        only["aspects"] = ["16:9"]
+        folder = pathlib.Path(tempfile.mkdtemp())
+        outcomes = {}
+        for name, data in (("mention-error", full_error), ("mention-empty", full_empty), ("only-failed", only)):
+            path = folder / f"{name}.json"
+            path.write_text(json.dumps(data))
+            report = batch([str(path)], tempfile.mkdtemp(), scale=0.25)
+            outcomes[name] = report["items"][0]["status"]
+        self.assertEqual(outcomes["mention-error"], "ok", outcomes)
+        self.assertEqual(outcomes["mention-empty"], "ok", outcomes)
+        self.assertEqual(outcomes["only-failed"], "blank-page", outcomes)
+
+    def test_empty_canvas_and_flat_body_are_blank(self):
+        for rel, detail in (
+            ("fixtures/empty-canvas.html", "empty-canvas"),
+            ("fixtures/empty-wall.html", "empty-frames"),
+        ):
+            data = example()
+            data["url"] = (ROOT / rel).resolve().as_uri()
+            data["title"] = "Wall"
+            data["steps"] = [{"action": "hold", "frames": 2}]
+            data["aspects"] = ["16:9"]
+            with self.assertRaises(RecordingFailure) as ctx:
+                direct(parse(data), tempfile.mkdtemp(), scale=0.3)
+            self.assertEqual(ctx.exception.kind, "blank-page", rel)
+            self.assertEqual(ctx.exception.detail, detail, rel)
 
     def test_derived_names_block_unless_allowlisted(self):
-        from demo_director.guard import derived_names, names_to_block
+        from demo_director.guard import derived_names, matched_terms, names_to_block
         self.assertEqual(derived_names("Maryland Men's Basketball"), ())
+        self.assertEqual(derived_names("Earth's sky tonight"), ())
+        self.assertEqual(derived_names("What's next for the Reader's group"), ())
+        self.assertEqual(derived_names("Meet at Oriole Park on Saturday"), ())
         self.assertEqual(derived_names("for a Saturday session"), ())
         self.assertEqual(derived_names("Alex's Chair"), ("Alex",))
-        self.assertEqual(derived_names("Built for Alex Example."), ("Alex Example", "Alex"))
+        self.assertEqual(derived_names("Built for Alex Quinn (@samplebot)."), ("@samplebot", "Alex Quinn", "Alex", "Quinn"))
         self.assertEqual(names_to_block("Alex's Chair", ("Alex",)), ())
+        # A README-only name is a watch term. It does not block a clean page.
         folder = pathlib.Path(tempfile.mkdtemp())
-        data = example()
-        data["title"] = "Alex's Chair"
-        data["url"] = (ROOT / "fixtures" / "named-chair.html").resolve().as_uri()
-        data["steps"] = [{"action": "hold", "frames": 2}]
-        data["aspects"] = ["16:9"]
-        path = folder / "chair.json"
-        path.write_text(json.dumps(data))
-        (folder / "README.md").write_text("# Desk\n\nSynthetic board for Alex Example.\n")
-        out = pathlib.Path(tempfile.mkdtemp())
-        blocked = batch([str(path)], str(out), scale=0.3)
+        (folder / "README.md").write_text("# Desk\n\nSynthetic board for Alex Quinn (@samplebot).\n")
+        clean = example()
+        clean["title"] = "Weekend Planner demo"
+        clean["steps"] = [{"action": "hold", "frames": 2}]
+        clean["aspects"] = ["16:9"]
+        clean_path = folder / "clean.json"
+        clean_path.write_text(json.dumps(clean))
+        clean_out = tempfile.mkdtemp()
+        clean_report = batch([str(clean_path)], clean_out, scale=0.25)
+        self.assertEqual(clean_report["items"][0]["status"], "ok", clean_report)
+        # The surname and the @handle block only when the page renders them.
+        leaked = folder / "leaked.html"
+        leaked.write_text(
+            "<style>body{margin:0;background:#102;color:#eee;font-family:system-ui}"
+            ".a{background:#7c2d12;color:#fff;padding:20px}.b{background:#14532d;color:#fff;padding:20px}"
+            ".c{background:#1e3a8a;color:#fff;padding:20px}</style>"
+            "<h1>Desk</h1><p>Everything Quinn (@samplebot) bookmarked for a Saturday session "
+            "with orange cones ready today.</p>"
+            "<div class=a>Cones</div><div class=b>Pinnies</div><div class=c>Whistle</div>"
+        )
+        seen = example()
+        seen["title"] = "Desk"
+        seen["url"] = leaked.resolve().as_uri()
+        seen["steps"] = [{"action": "hold", "frames": 2}]
+        seen["aspects"] = ["16:9"]
+        seen_path = folder / "seen.json"
+        seen_path.write_text(json.dumps(seen))
+        blocked = batch([str(seen_path)], tempfile.mkdtemp(), scale=0.25)
         item = blocked["items"][0]
         self.assertEqual(item["status"], "pii-blocked")
-        self.assertTrue(item["error"].endswith("name"))
-        self.assertIn("Alex", item["warning"])
-        self.assertNotIn("Miranda", item["warning"])
-        self.assertEqual(list(out.glob("demo-*.gif")), [])
-        allowed = batch([str(path)], tempfile.mkdtemp(), scale=0.3, allow_names=("Alex", "Alex Example"))
-        self.assertEqual(allowed["items"][0]["status"], "ok", allowed)
+        self.assertIn("Quinn:page", item["error"])
+        self.assertIn("@samplebot:page", item["error"])
+        self.assertIn("Quinn:page", item["detail"] if "detail" in item else item["error"])
+        self.assertNotIn("Miranda", item["error"])
+        # Explicit deny stays strict for a common word the watch list ignores.
+        denied = example()
+        denied["steps"] = [{"action": "caption", "text": "Earth's sky tonight", "frames": 2}]
+        denied["aspects"] = ["16:9"]
+        denied_path = folder / "earth.json"
+        denied_path.write_text(json.dumps(denied))
+        earth = batch([str(denied_path)], tempfile.mkdtemp(), scale=0.25, extra_names=("Earth",))
+        self.assertEqual(earth["items"][0]["status"], "pii-blocked")
+        self.assertIn("Earth", earth["items"][0]["error"])
+        self.assertIn("caption", earth["items"][0]["error"])
+        self.assertEqual(matched_terms(("Earth",), captions=("Earth's sky tonight",)), ("Earth:caption",))
 
 
 if __name__ == "__main__":

@@ -166,16 +166,33 @@ class BlankPolicy:
         r"\berror\b",
     )
 
-    def reason(self, text: str) -> str | None:
-        """A stable detail string, or None when the copy is enough and clean."""
+    def reason(self, text: str, prominent: str = "") -> str | None:
+        """Refuse when a phrase dominates, or the page has almost no copy.
+
+        A full page that merely mentions ``error`` or ``no scores yet`` is
+        fine. ``Failed to load data`` as the main copy is not. A phrase in a
+        heading or alert also refuses when little text sits outside that line.
+        """
         if not isinstance(text, str):
             return "no-visible-text"
+
+        def alnum(value: str) -> str:
+            return re.sub(r"[^0-9A-Za-z]", "", value or "")
+
+        meaningful = alnum(text)
+        outside = alnum(text)
+        if prominent:
+            # Drop one copy of the prominent block so "little else" is measurable.
+            outside = alnum(text.replace(prominent, "", 1))
         for pattern in self.patterns:
             match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                snippet = " ".join(match.group(0).split()).casefold()
+            if not match:
+                continue
+            snippet = " ".join(match.group(0).split()).casefold()
+            rest = len(meaningful) - len(alnum(match.group(0)))
+            in_prominent = bool(prominent) and re.search(pattern, prominent, re.IGNORECASE)
+            if rest < self.min_chars or (in_prominent and len(outside) < self.min_chars):
                 return f"error-phrase:{snippet}"
-        meaningful = re.sub(r"[^0-9A-Za-z]", "", text)
         if len(meaningful) < self.min_chars:
             return "sparse-text"
         return None
@@ -191,12 +208,15 @@ class PiiPolicy:
 
     names: tuple[str, ...] = ()
     allow: tuple[str, ...] = ()
+    watch: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        names = tuple(part.strip() for part in self.names if isinstance(part, str) and part.strip())
-        allow = tuple(part.strip() for part in self.allow if isinstance(part, str) and part.strip())
-        object.__setattr__(self, "names", names)
-        object.__setattr__(self, "allow", allow)
+        def _clean(parts: tuple[str, ...]) -> tuple[str, ...]:
+            return tuple(part.strip() for part in parts if isinstance(part, str) and part.strip())
+
+        object.__setattr__(self, "names", _clean(self.names))
+        object.__setattr__(self, "allow", _clean(self.allow))
+        object.__setattr__(self, "watch", _clean(self.watch))
 
 
 @dataclass(frozen=True)

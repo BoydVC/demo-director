@@ -8,7 +8,8 @@ import unittest
 from scripts.fleet_check import diff_status
 from scripts.fleet_check import diff_status
 from demo_director.propose import (
-    Control, PageControls, display_title, draft_from, dump_draft, human_title, init_source, synthetic_value,
+    Control, PageControls, display_title, draft_from, dump_draft, human_title, init_source,
+    resolve_title, synthetic_value,
 )
 from demo_director.session import RecordingFailure
 from demo_director.shotlist import parse
@@ -193,6 +194,24 @@ class InitTests(unittest.TestCase):
             init_source(str(logo), slug="four-game-jam").shotlist.title,
             "Four Game Jam",
         )
+
+    def test_shouted_h1_keeps_document_title_word_breaks(self):
+        """FOUR-GAMEJAM plus document title Four-Game Jam is Four Game Jam."""
+        self.assertEqual(resolve_title("FOUR-GAMEJAM", "Four-Game Jam", ""), "Four Game Jam")
+        self.assertEqual(resolve_title("CHOPSTICKS", "Chopsticks · a booster catch game", "chopsticks"), "Chopsticks")
+        self.assertEqual(resolve_title("Ravens Season Sim", "Ravens Season Sim 2026", "ravens-sim"), "Ravens Season Sim")
+        self.assertEqual(resolve_title("Starship Tower", "Starship Tower", "starship-tower"), "Starship Tower")
+        root = pathlib.Path(tempfile.mkdtemp()) / "logo-jam"
+        root.mkdir()
+        root.joinpath("index.html").write_text(
+            "<title>Four-Game Jam</title>"
+            "<style>body{margin:0;background:#102;color:#eee;font-family:system-ui}"
+            ".card{min-height:160px;background:#14532d;color:#fff;padding:16px}</style>"
+            "<h1><span>FOUR</span><span>-GAME</span><span>JAM</span></h1>"
+            "<p>Synthetic jam for a Saturday session with orange cones ready today.</p>"
+            "<div class=card>Play</div>"
+        )
+        self.assertEqual(init_source(str(root)).shotlist.title, "Four Game Jam")
 
     def test_fleet_expect_diff_lists_each_repo(self):
         lines = diff_status(

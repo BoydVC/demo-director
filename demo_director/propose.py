@@ -130,7 +130,7 @@ _DISCOVER_JS = r"""
   const results = [...document.querySelectorAll("#conf, #status, #result, #output, [data-result], .result")]
     .filter(visible).slice(0, 2).map(selectorOf);
   const text = document.body ? (document.body.innerText || "") : "";
-  return {title, inputs, buttons, results, text};
+  return {title, heading, documentTitle: docTitle, inputs, buttons, results, text};
 }
 """
 
@@ -147,6 +147,8 @@ class Control:
 class PageControls:
     title: str
     controls: tuple[Control, ...]
+    heading: str = ""
+    document_title: str = ""
 
 
 def headings_in(text: str) -> tuple[str, ...]:
@@ -202,6 +204,31 @@ def normalize_title(text: str) -> str:
 
 def _letters(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (text or "").casefold())
+
+
+def _run_together(text: str) -> bool:
+    """All caps, or one hyphenated token such as ``FOUR-GAMEJAM``."""
+    raw = " ".join((text or "").split())
+    if not raw:
+        return False
+    letters = re.sub(r"[^A-Za-z]", "", raw)
+    if letters and letters.isupper():
+        return True
+    return " " not in raw and bool(re.search(r"[-_]", raw))
+
+
+def resolve_title(heading: str, document_title: str = "", slug: str = "") -> str:
+    """Prefer a document title that spells the same letters with real word breaks.
+
+    ``FOUR-GAMEJAM`` plus ``Four-Game Jam`` becomes ``Four Game Jam``. A shouted
+    name whose document title is a different sentence, such as ``CHOPSTICKS``,
+    stays the normalized heading.
+    """
+    heading = " ".join((heading or "").split())
+    document_title = " ".join((document_title or "").split())
+    if heading and document_title and _run_together(heading) and _letters(heading) == _letters(document_title):
+        return normalize_title(document_title) or document_title
+    return display_title(heading or document_title, slug)
 
 
 def display_title(page_title: str, slug: str = "") -> str:
@@ -505,7 +532,12 @@ def probe(url: str) -> tuple[PageControls, tuple[str, ...], str]:
                 item for item in (str(entry) for entry in (raw.get("results") or []) if entry)
                 if _selector_visible(page, item)
             )
-            return PageControls(title=str(raw.get("title") or "Demo"), controls=tuple(controls)), results, text
+            return PageControls(
+                title=str(raw.get("title") or "Demo"),
+                controls=tuple(controls),
+                heading=str(raw.get("heading") or ""),
+                document_title=str(raw.get("documentTitle") or ""),
+            ), results, text
         finally:
             browser.close()
 
@@ -517,7 +549,9 @@ def from_page(url: str, fallback: str = "Demo", slug: str = "",
     _refuse(text)
     local = pathlib.Path(urlparse(url).path) if url.startswith("file:") else None
     readme = readme_near(local) if local is not None else ""
-    chosen = display_title(page.title or fallback, slug or fallback)
+    chosen = resolve_title(page.heading, page.document_title, slug or fallback)
+    if not page.heading and not page.document_title:
+        chosen = display_title(page.title or fallback, slug or fallback)
     terms = _deny_terms(deny_names, readme, chosen, derive)
     allowed = {part.casefold() for part in allow_names}
     terms = tuple(term for term in terms if term.casefold() not in allowed)

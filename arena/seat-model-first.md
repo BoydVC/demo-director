@@ -1,0 +1,4 @@
+# Seat B — model-first
+Repo: BoydVC/demo-director (public). Read SPEC.md and the v0.1 prototype on main first. Work on your own branch and open a DRAFT PR only. Never merge, never post to X or anywhere, synthetic data only, nothing KPD/collections. Keep `python -m unittest discover -s tests` green and add tests for every v1 goal you build. Commit a regenerated shots/demo-*.gif plus a gallery screenshot as proof.
+
+Lens: model the domain as a state machine first. Write a statechart (TLA+ or a small Python model) for the recording session: idle → navigating → acting → settling → captured, with failure states (selector-missing, timeout, pii-blocked). Prove: every step yields exactly one Beat or a typed failure; the PII guard can never be bypassed in batch mode; zoom rect always lies inside the frame. Turn each property into a test. Then implement SPEC v1 goals 1–6, emphasis on PII guard (#3) and batch determinism (#4). Branch: arena/model-first.

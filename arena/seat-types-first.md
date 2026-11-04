@@ -1,0 +1,4 @@
+# Seat A — types-first
+Repo: BoydVC/demo-director (public). Read SPEC.md and the v0.1 prototype on main first. Work on your own branch and open a DRAFT PR only. Never merge, never post to X or anywhere, synthetic data only, nothing KPD/collections. Keep `python -m unittest discover -s tests` green and add tests for every v1 goal you build. Commit a regenerated shots/demo-*.gif plus a gallery screenshot as proof.
+
+Lens: sketch types before code. Make illegal shot lists unrepresentable: a discriminated union of Step variants (Goto/Click/Type/Caption/Hold/Zoom), a Beat type, an Aspect enum, a RenderReport type, and a PiiPolicy. Validation at one boundary (parse), pure core after it. Then implement SPEC v1 goals 1–6, with emphasis on auto-shotlist (#1) returning a typed draft and the batch report (#4). Branch: arena/types-first.

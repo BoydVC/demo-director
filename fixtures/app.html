@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Weekend Planner (synthetic)</title>
+<style>body{font-family:system-ui;background:#0f172a;color:#e2e8f0;margin:0;padding:40px}
+h1{margin:0 0 8px}.sub{color:#94a3b8;margin-bottom:24px}.row{display:flex;gap:12px;margin-bottom:20px}
+input{flex:1;padding:14px;border-radius:10px;border:1px solid #334155;background:#1e293b;color:#fff;font-size:18px}
+button{padding:14px 22px;border:0;border-radius:10px;background:#f97316;color:#fff;font-weight:700;font-size:18px;cursor:pointer}
+.card{background:#1e293b;border-radius:12px;padding:16px 20px;margin-bottom:10px;display:flex;justify-content:space-between}
+.tag{background:#334155;border-radius:999px;padding:2px 10px;font-size:14px}#conf{color:#4ade80;font-weight:700;min-height:24px}</style></head>
+<body><h1>Weekend Planner</h1><div class="sub">Synthetic demo data · Team Alpha</div>
+<div class="row"><input id="ev" placeholder="Add an event…"><button id="add">Add</button><button id="pack">Find conflicts</button></div>
+<div id="list"><div class="card"><span>Sat 9:00 · Practice, Field 3</span><span class="tag">Team Alpha</span></div>
+<div class="card"><span>Sat 10:30 · Game vs Comets</span><span class="tag">Team Beta</span></div></div><div id="conf"></div>
+<script>add.onclick=()=>{if(!ev.value)return;const d=document.createElement('div');d.className='card';d.innerHTML='<span>'+ev.value+'</span><span class="tag">New</span>';list.appendChild(d);ev.value=''};
+pack.onclick=()=>{conf.textContent='1 conflict: Sat 10:00 overlaps Practice → suggest carpool swap'}</script></body></html>

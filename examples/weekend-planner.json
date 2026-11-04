@@ -1,0 +1,10 @@
+{"title":"Weekend Planner demo","url":"FIXTURE","aspects":["16:9","1:1","9:16"],"fps":10,
+ "steps":[
+  {"action":"caption","text":"Plan the whole weekend in 10 seconds","frames":8},
+  {"action":"type","selector":"#ev","text":"Sat 10:00 · Scrimmage, Field 1","frames":8},
+  {"action":"click","selector":"#add","frames":6},
+  {"action":"caption","text":"One tap finds conflicts","frames":4},
+  {"action":"click","selector":"#pack","frames":6},
+  {"action":"zoom","selector":"#conf","frames":8},
+  {"action":"hold","frames":12}
+ ]}

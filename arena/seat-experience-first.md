@@ -1,0 +1,4 @@
+# Seat C — experience-first
+Repo: BoydVC/demo-director (public). Read SPEC.md and the v0.1 prototype on main first. Work on your own branch and open a DRAFT PR only. Never merge, never post to X or anywhere, synthetic data only, nothing KPD/collections. Keep `python -m unittest discover -s tests` green and add tests for every v1 goal you build. Commit a regenerated shots/demo-*.gif plus a gallery screenshot as proof.
+
+Lens: the output is the product. Make the GIF look like a premium launch video: better cursor (shadow, motion blur), smart framing that keeps the target and its label in view (#2), 9:16 caption safe area, title card and end card, tasteful easing. Build the gallery (#5) as a polished static page and a one-command `demo-director init` (#1) that gets a zero-config repo to a good demo. Size budget ≤ 5 MB per GIF. Branch: arena/experience-first.

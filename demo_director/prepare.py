@@ -545,11 +545,22 @@ def _vite_preview_cmd(root: Path, port: int) -> list[str] | None:
     return cmd
 
 
+def _is_next_app(root: Path) -> bool:
+    return any(
+        (root / name).is_file()
+        for name in ("next.config.ts", "next.config.js", "next.config.mjs", "next.config.cjs")
+    ) or (root / ".next").is_dir()
+
+
 def _npm_serve_cmd(root: Path, port: int) -> list[str] | None:
     """Pick demo/dashboard/start/preview, skipping raw vite/next dev servers."""
     scripts = npm_scripts(root)
     if not scripts:
         return None
+    # Next.js App Router demos often ship a one-shot ``demo`` CLI that is not
+    # an HTTP server. Prefer ``next start`` once ``.next`` exists.
+    if _is_next_app(root) and (root / ".next").is_dir():
+        return ["npx", "--no-install", "next", "start", "-H", "127.0.0.1", "-p", str(port)]
     # Preference: seeded demo, then dashboard API, then start, then preview.
     order = ("demo", "dashboard", "start", "preview", "serve")
     for name in order:

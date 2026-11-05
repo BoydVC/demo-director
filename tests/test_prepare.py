@@ -199,6 +199,23 @@ class PrivateRebuildTests(unittest.TestCase):
 
 
 class PlaceholderAndPortTests(unittest.TestCase):
+    def test_next_app_prefers_next_start(self):
+        from demo_director.prepare import _npm_serve_cmd
+
+        root = Path(tempfile.mkdtemp())
+        (root / "next.config.ts").write_text("export default {}\n")
+        (root / ".next").mkdir()
+        (root / "package.json").write_text(json.dumps({
+            "scripts": {
+                "demo": "tsx src/bench/cli.ts --mode mock",
+                "start": "next start -p 4317",
+                "dev": "next dev",
+            },
+        }))
+        cmd = _npm_serve_cmd(root, 4633)
+        self.assertEqual(cmd[:3], ["npx", "--no-install", "next"])
+        self.assertIn("4633", cmd)
+
     def test_fill_html_placeholders_inlines_css_comment(self):
         from demo_director.prepare import fill_html_placeholders, run_build_hooks
 

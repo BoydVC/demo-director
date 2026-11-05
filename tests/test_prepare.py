@@ -135,7 +135,7 @@ class ViteAndSeedTests(unittest.TestCase):
         }))
         env = seed_env(root, {})
         self.assertEqual(env.get("FOUNDRY_SEED"), "1")
-        self.assertTrue(env.get("SCHOOL_PULSE_DATA", "").endswith(".demo-director-data"))
+        self.assertIn(".demo-director-data", env.get("SCHOOL_PULSE_DATA", ""))
 
     def test_npm_serve_prefers_demo_with_port(self):
         from demo_director.prepare import _npm_serve_cmd

@@ -196,3 +196,80 @@ class PrivateRebuildTests(unittest.TestCase):
         ran = run_build_hooks(root)
         self.assertNotIn("build_bank.py", ran)
         self.assertIn("export_static.py", ran)
+
+
+class PlaceholderAndPortTests(unittest.TestCase):
+    def test_fill_html_placeholders_inlines_css_comment(self):
+        from demo_director.prepare import fill_html_placeholders, run_build_hooks
+
+        root = Path(tempfile.mkdtemp())
+        web = root / "web"
+        web.mkdir()
+        (web / "museum.css").write_text("body{color:#efe;background:#123}")
+        (web / "museum.js").write_text("window.READY=1;")
+        (web / "index.html").write_text(
+            "<!doctype html><title>Museum</title><!--CSS--><body>"
+            "<canvas id=c></canvas><div id=hud>Lobby</div></body>"
+        )
+        (root / "site").mkdir()
+        ran = run_build_hooks(root)
+        self.assertIn("fill:placeholders", ran)
+        html = (web / "index.html").read_text()
+        self.assertIn("background:#123", html)
+        self.assertIn("<style>", html)
+        self.assertTrue((root / "site" / "index.html").is_file())
+
+    def test_render_py_is_a_build_hook(self):
+        from demo_director.prepare import run_build_hooks, find_entry
+
+        root = Path(tempfile.mkdtemp())
+        (root / "render.py").write_text(
+            "from pathlib import Path\n"
+            "root = Path(__file__).resolve().parent\n"
+            "(root / 'dist').mkdir(exist_ok=True)\n"
+            "(root / 'dist' / 'season-book-snapshot.html').write_text("
+            "'<!doctype html><title>Season</title><style>body{color:red}</style>"
+            "<body>season book snapshot content here</body>')\n"
+        )
+        ran = run_build_hooks(root)
+        self.assertIn("render.py", ran)
+        self.assertEqual(find_entry(root), "dist/season-book-snapshot.html")
+
+    def test_discover_port_env_keys_reads_server_py(self):
+        from demo_director.prepare import discover_port_env_keys, _port_env
+
+        root = Path(tempfile.mkdtemp())
+        (root / "server.py").write_text(
+            "import os\nPORT=int(os.environ.get('HUB_PORT', '4646'))\n"
+        )
+        keys = discover_port_env_keys(root)
+        self.assertIn("HUB_PORT", keys)
+        env = _port_env(4615, root)
+        self.assertEqual(env.get("HUB_PORT"), "4615")
+        self.assertEqual(env.get("PORT"), "4615")
+
+    def test_hub_style_server_binds_claimed_port(self):
+        from demo_director.prepare import start_server, wait_port
+
+        root = Path(tempfile.mkdtemp())
+        web = root / "web"
+        web.mkdir()
+        (web / "index.html").write_text(
+            "<!doctype html><title>Hub</title><body>hub projects board content</body>"
+        )
+        (root / "server.py").write_text(
+            "import http.server, os\n"
+            "PORT=int(os.environ.get('HUB_PORT','4646'))\n"
+            "class H(http.server.SimpleHTTPRequestHandler):\n"
+            "    def __init__(self,*a,**k):\n"
+            "        super().__init__(*a, directory=os.path.join(os.path.dirname(__file__),'web'), **k)\n"
+            "    def log_message(self,*a): pass\n"
+            "http.server.ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()\n"
+        )
+        sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
+        server = start_server(root, port)
+        try:
+            self.assertEqual(server.mode, "server.py")
+            self.assertTrue(wait_port(port, 3))
+        finally:
+            server.stop()

@@ -57,6 +57,7 @@ BUILD_SCRIPTS = (
     "build_snapshot.py",
     "export_static.py",
     "export_snapshot.py",
+    "render.py",
 )
 
 PORT_ENV_KEYS = (
@@ -65,6 +66,14 @@ PORT_ENV_KEYS = (
     "SMC_PORT",
     "MUSEUM_PORT",
     "HQ_PORT",
+    "HUB_PORT",
+    "SB_PORT",
+    "TN_PORT",
+    "WS_PORT",
+    "TBA_PORT",
+    "RR_PORT",
+    "KCS_PORT",
+    "STARLINK_GLOBE_PORT",
     "BOT_ISLAND_3D_PORT",
     "BOT_ISLAND_ARCADE_PORT",
     "CHELSEA_TM_PORT",
@@ -216,6 +225,65 @@ def ensure_npm_install(root: Path, env: dict | None = None, timeout: int = 240) 
     return proc.returncode == 0 and (root / "node_modules").is_dir()
 
 
+
+def fill_html_placeholders(root: Path) -> list[str]:
+    """Inline sibling CSS/JS into common template markers when build.py did not.
+
+    Handles ``/*__CSS__*/`` / ``/*__APP__*/`` and HTML comments ``<!--CSS-->`` /
+    ``<!--JS-->``. Returns the relative paths that were rewritten.
+    """
+    rewritten: list[str] = []
+    candidates: list[Path] = []
+    for rel in ("web/index.html", "index.html", "public/index.html", "src/template.html"):
+        path = root / rel
+        if path.is_file():
+            candidates.append(path)
+    for path in candidates:
+        try:
+            html = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        original = html
+        parent = path.parent
+        css_files = sorted(
+            [p for p in parent.glob("*.css") if p.is_file()],
+            key=lambda p: (0 if "app" in p.name or "museum" in p.name or "style" in p.name else 1, p.name),
+        )
+        js_files = sorted(
+            [p for p in parent.glob("*.js") if p.is_file() and "test" not in p.name],
+            key=lambda p: (0 if "app" in p.name or "museum" in p.name else 1, p.name),
+        )
+        if "/*__CSS__*/" in html and css_files:
+            html = html.replace("/*__CSS__*/", css_files[0].read_text(encoding="utf-8", errors="ignore"), 1)
+        if "/*__APP__*/" in html and js_files:
+            js = js_files[0].read_text(encoding="utf-8", errors="ignore").replace("</script", "<\\/script")
+            html = html.replace("/*__APP__*/", js, 1)
+        if "<!--CSS-->" in html and css_files:
+            css = css_files[0].read_text(encoding="utf-8", errors="ignore")
+            html = html.replace("<!--CSS-->", f"<style>\n{css}\n</style>", 1)
+        if "<!--JS-->" in html and js_files:
+            js = js_files[0].read_text(encoding="utf-8", errors="ignore").replace("</script", "<\\/script")
+            html = html.replace("<!--JS-->", f"<script>\n{js}\n</script>", 1)
+        # museum-style: comment CSS filled but external script still referenced — leave as-is
+        # If still no <script> body and a museum.js/app.js exists next to a canvas page, append it.
+        if html != original and "<script" not in html.lower() and js_files:
+            js = js_files[0].read_text(encoding="utf-8", errors="ignore").replace("</script", "<\\/script")
+            if "</body>" in html:
+                html = html.replace("</body>", f"<script>\n{js}\n</script></body>", 1)
+            else:
+                html += f"<script>\n{js}\n</script>"
+        if html == original:
+            continue
+        path.write_text(html, encoding="utf-8")
+        rewritten.append(path.relative_to(root).as_posix())
+        # Stage into site/ when server.py serves an empty site directory.
+        site = root / "site"
+        if site.is_dir() and not (site / "index.html").is_file() and path.name == "index.html":
+            (site / "index.html").write_text(html, encoding="utf-8")
+            rewritten.append("site/index.html")
+    return rewritten
+
+
 def run_build_hooks(root: Path, env: dict | None = None, timeout: int = 90) -> list[str]:
     """Run known seed/build/export scripts. Returns the names that exited 0."""
     env = dict(env or os.environ)
@@ -267,6 +335,9 @@ def run_build_hooks(root: Path, env: dict | None = None, timeout: int = 90) -> l
             proc = None
         if proc is not None and proc.returncode == 0:
             ran.append("npm:build")
+    filled = fill_html_placeholders(root)
+    if filled:
+        ran.append("fill:placeholders")
     return ran
 
 
@@ -294,9 +365,28 @@ def seed_env(root: Path, env: dict) -> dict:
     return out
 
 
+def discover_port_env_keys(root: Path | None) -> tuple[str, ...]:
+    """Union of known PORT keys and any ``*PORT`` names referenced in server.py."""
+    keys = list(PORT_ENV_KEYS)
+    if root is None:
+        return tuple(keys)
+    server = root / "server.py"
+    if not server.is_file():
+        return tuple(keys)
+    try:
+        blob = server.read_text(encoding="utf-8", errors="ignore")[:40_000]
+    except OSError:
+        return tuple(keys)
+    found = re.findall(r'["\']([A-Z][A-Z0-9_]*PORT)["\']', blob)
+    for key in found:
+        if key not in keys:
+            keys.append(key)
+    return tuple(keys)
+
+
 def _port_env(port: int, root: Path | None = None) -> dict:
     env = os.environ.copy()
-    for key in PORT_ENV_KEYS:
+    for key in discover_port_env_keys(root):
         env[key] = str(port)
     env["HOST"] = "127.0.0.1"
     env["PYTHONUNBUFFERED"] = "1"
@@ -381,6 +471,8 @@ def wait_http_ready(url: str, timeout: float = 20) -> bool:
             text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
             text = re.sub(r"<[^>]+>", " ", text)
             text = re.sub(r"\s+", " ", text).strip()
+            if "Directory listing for" in raw:
+                return False
             if text and not page_looks_loading(text):
                 return True
         except (URLError, OSError, TimeoutError):
@@ -465,10 +557,14 @@ def _npm_serve_cmd(root: Path, port: int) -> list[str] | None:
         if not isinstance(start, str) or not start.strip():
             continue
         low = start.lower()
-        # Never launch a cold Vite/Next dev server from here; preview is separate.
-        if name != "preview" and ("vite" in low or "next dev" in low or "next start" in low):
-            if "preview" not in low:
-                continue
+        # Never launch a cold Vite/Next *dev* server from here; preview is separate.
+        # A production ``next start`` is fine once ``.next`` exists from npm run build.
+        if name != "preview" and ("vite" in low and "preview" not in low):
+            continue
+        if "next dev" in low:
+            continue
+        if "next start" in low and not (root / ".next").is_dir():
+            continue
         if name == "demo":
             # Prefer the compiled CLI directly so forked fleet workers do not
             # depend on npm's script runner.
@@ -487,6 +583,8 @@ def _npm_serve_cmd(root: Path, port: int) -> list[str] | None:
                 return _vite_preview_cmd(root, port)
             return ["npm", "run", "preview", "--silent", "--", "--host", "127.0.0.1", "--port", str(port)]
         if name in {"start", "serve"}:
+            if "next start" in low:
+                return ["npx", "--no-install", "next", "start", "-H", "127.0.0.1", "-p", str(port)]
             if start.strip().startswith("node "):
                 # Append --port when the CLI looks like school-pulse serve.
                 parts = start.strip().split()
@@ -509,9 +607,12 @@ def start_server(root: Path, port: int, entry: str | None = None) -> RunningServ
         proc = _spawn([sys.executable, "server.py"], root, env)
         if wait_port(port, timeout=15):
             url = f"http://127.0.0.1:{port}/"
-            wait_http_ready(url, timeout=8)
-            return RunningServer(proc, port, url, "server.py", entry)
-        _stop_proc(proc)
+            if wait_http_ready(url, timeout=8):
+                return RunningServer(proc, port, url, "server.py", entry)
+            # Bound but empty/dir-listing (e.g. museum site/ before build) — fall through.
+            _stop_proc(proc)
+        else:
+            _stop_proc(proc)
     elif server_py.is_file() and reads_private_sources(server_py):
         # Stage checked-in JSON next to the static web UI so http.server can
         # satisfy /bank.json without rebuilding from private sheets.

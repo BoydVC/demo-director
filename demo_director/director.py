@@ -350,7 +350,8 @@ def wait_for_ready(page, timeout_ms: int = 20000) -> None:
 
     Demo Director used to snapshot "Loading the household…" and empty API
     boards. A short poll gives seeded servers time to paint real content
-    without failing closed on a still-loading first paint.
+    without failing closed on a still-loading first paint. A large visible
+    canvas with no DOM copy (canvas-only games) is also treated as ready.
     """
     deadline = timeout_ms
     stepped = 0
@@ -360,6 +361,26 @@ def wait_for_ready(page, timeout_ms: int = 20000) -> None:
         except Exception:
             text = ""
         if text.strip() and not page_looks_loading(text):
+            return
+        try:
+            share = page.evaluate(
+                """() => {
+                  const vw = Math.max(window.innerWidth || 0, 1);
+                  const vh = Math.max(window.innerHeight || 0, 1);
+                  let area = 0;
+                  for (const canvas of document.querySelectorAll('canvas')) {
+                    const style = getComputedStyle(canvas);
+                    if (style.visibility === 'hidden' || style.display === 'none') continue;
+                    const rect = canvas.getBoundingClientRect();
+                    if (rect.width < 32 || rect.height < 32) continue;
+                    area += Math.max(0, rect.width) * Math.max(0, rect.height);
+                  }
+                  return area / (vw * vh);
+                }"""
+            )
+        except Exception:
+            share = 0
+        if isinstance(share, (int, float)) and share >= 0.18 and not page_looks_loading(text):
             return
         page.wait_for_timeout(250)
         stepped += 250
@@ -388,7 +409,14 @@ def page_problem(page, response, policy: BlankPolicy | None = None) -> str | Non
     main = raw.get("main") if isinstance(raw.get("main"), str) else ""
     if not raw.get("styled"):
         return "unstyled"
+    canvas_share = raw.get("canvasShare")
+    has_canvas = isinstance(canvas_share, (int, float)) and canvas_share >= 0.18
+    # Canvas-only games (bridge-penalties etc.) draw every label on the
+    # canvas and leave the DOM body empty. Treat a large visible canvas as
+    # content; empty-canvas detection later still refuses a flat field.
     if not text.strip():
+        if has_canvas:
+            return None
         return "no-visible-text"
     prominent = raw.get("prominent") if isinstance(raw.get("prominent"), str) else ""
     # The main region can be an error shell while the header and footer
@@ -397,12 +425,7 @@ def page_problem(page, response, policy: BlankPolicy | None = None) -> str | Non
     # Canvas games often ship with a short title chrome and almost no copy.
     # A visible canvas that already covers a meaningful share of the viewport
     # is the demo; sparse-text alone must not refuse it.
-    canvas_share = raw.get("canvasShare")
-    if (
-        problem == "sparse-text"
-        and isinstance(canvas_share, (int, float))
-        and canvas_share >= 0.18
-    ):
+    if problem == "sparse-text" and has_canvas:
         problem = None
     if problem:
         return problem

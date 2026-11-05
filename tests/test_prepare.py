@@ -150,9 +150,11 @@ class ViteAndSeedTests(unittest.TestCase):
         }))
         cmd = _npm_serve_cmd(root, 4611)
         self.assertIsNotNone(cmd)
-        self.assertEqual(cmd[:3], ["npm", "run", "demo"])
         self.assertIn("--port", cmd)
         self.assertIn("4611", cmd)
+        self.assertTrue(cmd[0] in {"npm", "node"})
+        if cmd[0] == "npm":
+            self.assertEqual(cmd[:3], ["npm", "run", "demo"])
 
     def test_vite_preview_cmd_includes_config_and_port(self):
         from demo_director.prepare import _vite_preview_cmd

@@ -287,7 +287,8 @@ def seed_env(root: Path, env: dict) -> dict:
             )
     # School Pulse demo seeds its own sqlite; keep data under the checkout.
     if "demo" in scripts and has_fixtures:
-        data = root / ".demo-director-data"
+        port = out.get("PORT") or out.get("SCHOOL_PULSE_PORT") or "0"
+        data = root / f".demo-director-data-{port}"
         data.mkdir(parents=True, exist_ok=True)
         out.setdefault("SCHOOL_PULSE_DATA", str(data))
     return out
@@ -469,7 +470,12 @@ def _npm_serve_cmd(root: Path, port: int) -> list[str] | None:
             if "preview" not in low:
                 continue
         if name == "demo":
-            # school-pulse and friends take --port on the CLI, not always via PORT.
+            # Prefer the compiled CLI directly so forked fleet workers do not
+            # depend on npm's script runner.
+            cli = root / "dist" / "src" / "cli.js"
+            if cli.is_file():
+                return ["node", "--disable-warning=ExperimentalWarning", str(cli),
+                        "demo", "--port", str(port), "--host", "127.0.0.1"]
             return ["npm", "run", "demo", "--silent", "--", "--port", str(port), "--host", "127.0.0.1"]
         if name == "dashboard":
             if start.strip().startswith("tsx ") or start.strip().startswith("node "):

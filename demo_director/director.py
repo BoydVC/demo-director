@@ -345,7 +345,7 @@ _PAGE_STATE_JS = """
 
 
 
-def wait_for_ready(page, timeout_ms: int = 12000) -> None:
+def wait_for_ready(page, timeout_ms: int = 20000) -> None:
     """Hold until loading-shell copy clears, or the timeout elapses.
 
     Demo Director used to snapshot "Loading the household…" and empty API

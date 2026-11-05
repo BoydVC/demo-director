@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -400,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         print(args.out.read_text())
         return _report_expect(args.expect, json.loads(args.out.read_text()).get("repos") or [])
     workers = max(1, args.jobs)
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as pool:
         futures = {
             pool.submit(
                 check_repo, repo, group, args.org, str(args.workdir),

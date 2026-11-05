@@ -347,6 +347,20 @@ class GuardTests(unittest.TestCase):
             direct(parse(data), tempfile.mkdtemp(), scale=0.3)
         self.assertEqual(ctx.exception.detail, "sparse-text")
 
+
+    def test_canvas_game_is_not_sparse(self):
+        """A short title over a large drawn canvas is a demo, not sparse-text."""
+        data = example()
+        data["url"] = (ROOT / "fixtures" / "canvas-game.html").resolve().as_uri()
+        data["title"] = "Canvas Drive"
+        data["steps"] = [{"action": "hold", "frames": 2}]
+        data["aspects"] = ["16:9"]
+        out = tempfile.mkdtemp()
+        rendered = direct(parse(data), out, scale=0.3)
+        self.assertTrue(rendered)
+        gifs = [row.get("gif") for row in rendered.values() if isinstance(row, dict)]
+        self.assertTrue(any(gif and pathlib.Path(gif).is_file() for gif in gifs))
+
     def test_phrase_dominates_or_a_full_page_renders(self):
         full_error = example()
         full_error["url"] = (ROOT / "fixtures" / "mention-error.html").resolve().as_uri()

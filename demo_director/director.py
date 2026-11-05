@@ -327,7 +327,18 @@ _PAGE_STATE_JS = """
   }
   const prominent = [...document.querySelectorAll("h1,h2,[role=alert],[role=status]")]
     .map((el) => (el.innerText || "").trim()).filter(Boolean).join("\\n");
-  return {text, main, styled, prominent};
+  const vw = Math.max(window.innerWidth || 0, 1);
+  const vh = Math.max(window.innerHeight || 0, 1);
+  let canvasArea = 0;
+  for (const canvas of document.querySelectorAll("canvas")) {
+    const style = getComputedStyle(canvas);
+    if (style.visibility === "hidden" || style.display === "none") continue;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width < 32 || rect.height < 32) continue;
+    canvasArea += Math.max(0, rect.width) * Math.max(0, rect.height);
+  }
+  const canvasShare = canvasArea / (vw * vh);
+  return {text, main, styled, prominent, canvasShare};
 }
 """
 
@@ -361,6 +372,16 @@ def page_problem(page, response, policy: BlankPolicy | None = None) -> str | Non
     # The main region can be an error shell while the header and footer
     # still add enough characters to look like a page.
     problem = rules.reason(text, prominent)
+    # Canvas games often ship with a short title chrome and almost no copy.
+    # A visible canvas that already covers a meaningful share of the viewport
+    # is the demo; sparse-text alone must not refuse it.
+    canvas_share = raw.get("canvasShare")
+    if (
+        problem == "sparse-text"
+        and isinstance(canvas_share, (int, float))
+        and canvas_share >= 0.18
+    ):
+        problem = None
     if problem:
         return problem
     # Header and footer can pad the body while main itself is the error.

@@ -25,6 +25,31 @@ from urllib.request import urlopen
 
 SKIP_DIRS = {".git", "node_modules", "vendor", ".venv", "venv"}
 
+PRIVATE_PATH_MARKERS = (
+    "/workspace/hspt",
+    "/workspace/tokenmax/hspt",
+    "/cursor/stores/",
+    "HQ_HSPT_ROOT",
+)
+
+
+def reads_private_sources(path: Path) -> bool:
+    """True when a script would rebuild from private box files (e.g. HSPT sheets)."""
+    try:
+        head = path.read_text(encoding="utf-8", errors="ignore")[:80_000]
+    except OSError:
+        return False
+    if any(marker in head for marker in PRIVATE_PATH_MARKERS):
+        return True
+    pattern = r"(?:import|from)\s+(build_bank)" + r"\b"
+    for match in re.finditer(pattern, head):
+        sibling = path.parent / f"{match.group(1)}.py"
+        if sibling.is_file() and sibling.resolve() != path.resolve():
+            if reads_private_sources(sibling):
+                return True
+    return False
+
+
 # Order matters: data builders first, then page builders, then offline snapshots.
 BUILD_SCRIPTS = (
     "build_data.py",
@@ -200,6 +225,9 @@ def run_build_hooks(root: Path, env: dict | None = None, timeout: int = 90) -> l
     for name in BUILD_SCRIPTS:
         script = root / name
         if not script.is_file():
+            continue
+        if reads_private_sources(script):
+            # Never rebuild public demos from private tutor sheets / inbox trees.
             continue
         try:
             proc = subprocess.run(
@@ -470,13 +498,25 @@ def start_server(root: Path, port: int, entry: str | None = None) -> RunningServ
     if entry is None:
         entry = find_entry(root)
 
-    if (root / "server.py").is_file():
+    server_py = root / "server.py"
+    if server_py.is_file() and not reads_private_sources(server_py):
         proc = _spawn([sys.executable, "server.py"], root, env)
         if wait_port(port, timeout=15):
             url = f"http://127.0.0.1:{port}/"
             wait_http_ready(url, timeout=8)
             return RunningServer(proc, port, url, "server.py", entry)
         _stop_proc(proc)
+    elif server_py.is_file() and reads_private_sources(server_py):
+        # Stage checked-in JSON next to the static web UI so http.server can
+        # satisfy /bank.json without rebuilding from private sheets.
+        import shutil
+        web = root / "web"
+        data = root / "data"
+        if web.is_dir() and data.is_dir():
+            for src in data.glob("*.json"):
+                dest = web / src.name
+                if not dest.is_file():
+                    shutil.copy2(src, dest)
 
     npm_cmd = _npm_serve_cmd(root, port)
     if npm_cmd is not None:

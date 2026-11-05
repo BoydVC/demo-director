@@ -175,3 +175,22 @@ class ViteAndSeedTests(unittest.TestCase):
         port = pick_free_port(4600, 4699)
         self.assertTrue(4600 <= port <= 4699)
         release_port(port)
+
+
+class PrivateRebuildTests(unittest.TestCase):
+    def test_skips_private_rebuild_scripts(self):
+        from demo_director.prepare import reads_private_sources, run_build_hooks
+
+        root = Path(tempfile.mkdtemp())
+        (root / "build_bank.py").write_text(
+            "import os\nSRC = os.environ.get(\"HQ_HSPT_ROOT\", \"/workspace/hspt\")\n"
+        )
+        (root / "export_static.py").write_text(
+            "from pathlib import Path\n"
+            "Path(\"dist\").mkdir(exist_ok=True)\n"
+            "Path(\"dist/ok.html\").write_text(\"<!doctype html><title>Ok</title><body>offline demo content here</body>\")\n"
+        )
+        self.assertTrue(reads_private_sources(root / "build_bank.py"))
+        ran = run_build_hooks(root)
+        self.assertNotIn("build_bank.py", ran)
+        self.assertIn("export_static.py", ran)

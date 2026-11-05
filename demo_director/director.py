@@ -23,6 +23,7 @@ from . import compose
 from .guard import hits, load_deny_terms, locate_denied, name_detail
 from .session import Phase, RecordingFailure, Session, StepSignals, run_step
 from .shotlist import ASPECTS, FIXTURE_URL
+from .prepare import page_looks_loading
 from .types import Beat, BlankPolicy, Box, ShotList, step_selector, step_text
 
 TITLE_FRAMES = 12
@@ -327,9 +328,62 @@ _PAGE_STATE_JS = """
   }
   const prominent = [...document.querySelectorAll("h1,h2,[role=alert],[role=status]")]
     .map((el) => (el.innerText || "").trim()).filter(Boolean).join("\\n");
-  return {text, main, styled, prominent};
+  const vw = Math.max(window.innerWidth || 0, 1);
+  const vh = Math.max(window.innerHeight || 0, 1);
+  let canvasArea = 0;
+  for (const canvas of document.querySelectorAll("canvas")) {
+    const style = getComputedStyle(canvas);
+    if (style.visibility === "hidden" || style.display === "none") continue;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width < 32 || rect.height < 32) continue;
+    canvasArea += Math.max(0, rect.width) * Math.max(0, rect.height);
+  }
+  const canvasShare = canvasArea / (vw * vh);
+  return {text, main, styled, prominent, canvasShare};
 }
 """
+
+
+
+def wait_for_ready(page, timeout_ms: int = 20000) -> None:
+    """Hold until loading-shell copy clears, or the timeout elapses.
+
+    Demo Director used to snapshot "Loading the household…" and empty API
+    boards. A short poll gives seeded servers time to paint real content
+    without failing closed on a still-loading first paint. A large visible
+    canvas with no DOM copy (canvas-only games) is also treated as ready.
+    """
+    deadline = timeout_ms
+    stepped = 0
+    while stepped < deadline:
+        try:
+            text = page.inner_text("body")
+        except Exception:
+            text = ""
+        if text.strip() and not page_looks_loading(text):
+            return
+        try:
+            share = page.evaluate(
+                """() => {
+                  const vw = Math.max(window.innerWidth || 0, 1);
+                  const vh = Math.max(window.innerHeight || 0, 1);
+                  let area = 0;
+                  for (const canvas of document.querySelectorAll('canvas')) {
+                    const style = getComputedStyle(canvas);
+                    if (style.visibility === 'hidden' || style.display === 'none') continue;
+                    const rect = canvas.getBoundingClientRect();
+                    if (rect.width < 32 || rect.height < 32) continue;
+                    area += Math.max(0, rect.width) * Math.max(0, rect.height);
+                  }
+                  return area / (vw * vh);
+                }"""
+            )
+        except Exception:
+            share = 0
+        if isinstance(share, (int, float)) and share >= 0.18 and not page_looks_loading(text):
+            return
+        page.wait_for_timeout(250)
+        stepped += 250
 
 
 def page_problem(page, response, policy: BlankPolicy | None = None) -> str | None:
@@ -355,12 +409,24 @@ def page_problem(page, response, policy: BlankPolicy | None = None) -> str | Non
     main = raw.get("main") if isinstance(raw.get("main"), str) else ""
     if not raw.get("styled"):
         return "unstyled"
+    canvas_share = raw.get("canvasShare")
+    has_canvas = isinstance(canvas_share, (int, float)) and canvas_share >= 0.18
+    # Canvas-only games (bridge-penalties etc.) draw every label on the
+    # canvas and leave the DOM body empty. Treat a large visible canvas as
+    # content; empty-canvas detection later still refuses a flat field.
     if not text.strip():
+        if has_canvas:
+            return None
         return "no-visible-text"
     prominent = raw.get("prominent") if isinstance(raw.get("prominent"), str) else ""
     # The main region can be an error shell while the header and footer
     # still add enough characters to look like a page.
     problem = rules.reason(text, prominent)
+    # Canvas games often ship with a short title chrome and almost no copy.
+    # A visible canvas that already covers a meaningful share of the viewport
+    # is the demo; sparse-text alone must not refuse it.
+    if problem == "sparse-text" and has_canvas:
+        problem = None
     if problem:
         return problem
     # Header and footer can pad the body while main itself is the error.
@@ -437,6 +503,7 @@ def _collect_lines(page) -> tuple[Box, ...]:
 def _perform(page, step, policy: BlankPolicy | None = None) -> None:
     if step.action == "goto":
         response = page.goto(step.url, timeout=15000)
+        wait_for_ready(page)
         refuse_unusable(page, response, policy=policy)
     elif step.action == "click":
         page.click(step.selector, timeout=5000)
@@ -726,6 +793,7 @@ def record(sl: ShotList) -> list[Beat]:
             opened = visible
             clicked = False
             policy = sl.blank or BlankPolicy()
+            wait_for_ready(page)
             refuse_unusable(page, response, policy=policy)
             page.wait_for_timeout(250)
             canvas_flags = [_dominant_canvas_blank(page)]

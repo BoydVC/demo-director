@@ -26,12 +26,15 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 SKIP_DIRS = {".git", "node_modules", "vendor"}
+
+from demo_director.prepare import pick_free_port, prepare_and_serve  # noqa: E402
 
 
 def _read_set(path: Path) -> list[tuple[str, str]]:
@@ -230,14 +233,24 @@ def _replay(shot: dict, terms: tuple[str, ...], port: int) -> list[str]:
 
 
 def check_repo(repo: str, group: str, org: str, work: str, deny: str,
-               scale: float, port: int) -> dict:
+               scale: float, port: int, src_root: str | None = None,
+               allow_clone: bool = False) -> dict:
     row: dict = {"repo": repo, "group": group, "status": "other", "detail": "", "title": ""}
-    root = Path(work) / "src" / repo
+    if port <= 0:
+        port = pick_free_port(4600, 4699)
+    if src_root:
+        root = Path(src_root) / repo
+    else:
+        root = Path(work) / "src" / repo
     env = os.environ.copy()
     env["DEMO_DIRECTOR_DENY"] = deny
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
-    if not (root / ".git").is_dir():
+    if not root.is_dir():
+        if not allow_clone:
+            row["detail"] = "missing local src (pass --src-root or --allow-clone)"
+            row["bucket"] = "other"
+            return row
         root.parent.mkdir(parents=True, exist_ok=True)
         code, _out, err = _run(
             ["git", "clone", "--depth", "1", f"https://github.com/{org}/{repo}.git", str(root)],
@@ -248,28 +261,19 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
             row["bucket"] = "other"
             row["stderr"] = err[-400:]
             return row
-    # Same as a local `python3 build.py` in the repo: relative paths and dist/ output.
-    if (root / "build.py").is_file():
-        _run([sys.executable, "build.py"], env, 90, cwd=root)
-        row["built"] = True
-    else:
-        row["built"] = False
-    rel = _entry(root)
-    if rel is None:
-        row["detail"] = "no html entry"
-        row["bucket"] = "other"
-        return row
-    server = subprocess.Popen(
-        [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
-        cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # Build hooks (build.py, export_static.py, …) then prefer server.py / npm.
     try:
-        if not _wait_port(port):
-            row["detail"] = "server did not start"
-            row["bucket"] = "other"
-            return row
-        url = f"http://127.0.0.1:{port}/{rel}"
+        server, built_names = prepare_and_serve(root, port, env=env)
+    except Exception as exc:
+        row["detail"] = f"serve failed: {type(exc).__name__}: {exc}"
+        row["bucket"] = "other"
+        row["built"] = False
+        return row
+    row["built"] = bool(built_names)
+    row["hooks"] = built_names
+    row["serve"] = server.mode
+    try:
+        url = server.url
         shot_path = Path(work) / "shots" / f"{repo}.json"
         outdir = Path(work) / "out" / repo
         shot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,10 +328,7 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
             row["stderr"] = stderr[-200:]
         return row
     finally:
-        try:
-            os.killpg(server.pid, 15)
-        except OSError:
-            server.kill()
+        server.stop()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -343,6 +344,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--only", action="append", default=[])
     ap.add_argument("--expect", type=Path, default=None,
                     help="JSON object of repo to bucket; print a per-repo diff")
+    ap.add_argument("--src-root", type=Path, default=None,
+                    help="Directory of already-extracted repo checkouts (no git clone)")
+    ap.add_argument("--allow-clone", action="store_true",
+                    help="Permit git clone when a repo is missing under --src-root/work")
     args = ap.parse_args(argv)
     rows = _read_set(args.set)
     if args.only:
@@ -396,11 +401,13 @@ def main(argv: list[str] | None = None) -> int:
         print(args.out.read_text())
         return _report_expect(args.expect, json.loads(args.out.read_text()).get("repos") or [])
     workers = max(1, args.jobs)
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as pool:
         futures = {
             pool.submit(
                 check_repo, repo, group, args.org, str(args.workdir),
-                str(args.deny), args.scale, 46000 + index,
+                str(args.deny), args.scale, 0,
+                str(args.src_root) if args.src_root else None,
+                bool(args.allow_clone),
             ): repo
             for repo, group, index in pending
         }

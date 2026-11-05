@@ -23,6 +23,7 @@ from . import compose
 from .guard import hits, load_deny_terms, locate_denied, name_detail
 from .session import Phase, RecordingFailure, Session, StepSignals, run_step
 from .shotlist import ASPECTS, FIXTURE_URL
+from .prepare import page_looks_loading
 from .types import Beat, BlankPolicy, Box, ShotList, step_selector, step_text
 
 TITLE_FRAMES = 12
@@ -343,6 +344,27 @@ _PAGE_STATE_JS = """
 """
 
 
+
+def wait_for_ready(page, timeout_ms: int = 12000) -> None:
+    """Hold until loading-shell copy clears, or the timeout elapses.
+
+    Demo Director used to snapshot "Loading the household…" and empty API
+    boards. A short poll gives seeded servers time to paint real content
+    without failing closed on a still-loading first paint.
+    """
+    deadline = timeout_ms
+    stepped = 0
+    while stepped < deadline:
+        try:
+            text = page.inner_text("body")
+        except Exception:
+            text = ""
+        if text.strip() and not page_looks_loading(text):
+            return
+        page.wait_for_timeout(250)
+        stepped += 250
+
+
 def page_problem(page, response, policy: BlankPolicy | None = None) -> str | None:
     """Blank, unstyled, sparse, or an error page. None when the page is demoable.
 
@@ -458,6 +480,7 @@ def _collect_lines(page) -> tuple[Box, ...]:
 def _perform(page, step, policy: BlankPolicy | None = None) -> None:
     if step.action == "goto":
         response = page.goto(step.url, timeout=15000)
+        wait_for_ready(page)
         refuse_unusable(page, response, policy=policy)
     elif step.action == "click":
         page.click(step.selector, timeout=5000)
@@ -747,6 +770,7 @@ def record(sl: ShotList) -> list[Beat]:
             opened = visible
             clicked = False
             policy = sl.blank or BlankPolicy()
+            wait_for_ready(page)
             refuse_unusable(page, response, policy=policy)
             page.wait_for_timeout(250)
             canvas_flags = [_dominant_canvas_blank(page)]

@@ -33,7 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 SKIP_DIRS = {".git", "node_modules", "vendor"}
 
-from demo_director.prepare import prepare_and_serve  # noqa: E402
+from demo_director.prepare import pick_free_port, prepare_and_serve  # noqa: E402
 
 
 def _read_set(path: Path) -> list[tuple[str, str]]:
@@ -235,6 +235,8 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
                scale: float, port: int, src_root: str | None = None,
                allow_clone: bool = False) -> dict:
     row: dict = {"repo": repo, "group": group, "status": "other", "detail": "", "title": ""}
+    if port <= 0:
+        port = pick_free_port(4600, 4699)
     if src_root:
         root = Path(src_root) / repo
     else:
@@ -402,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         futures = {
             pool.submit(
                 check_repo, repo, group, args.org, str(args.workdir),
-                str(args.deny), args.scale, 46000 + index,
+                str(args.deny), args.scale, 0,
                 str(args.src_root) if args.src_root else None,
                 bool(args.allow_clone),
             ): repo

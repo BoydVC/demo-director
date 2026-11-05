@@ -95,3 +95,83 @@ class PrepareTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ViteAndSeedTests(unittest.TestCase):
+    def test_is_vite_app_detects_config_and_scripts(self):
+        from demo_director.prepare import is_vite_app, vite_config
+
+        root = Path(tempfile.mkdtemp())
+        (root / "web").mkdir()
+        (root / "web" / "vite.config.ts").write_text(
+            "import { defineConfig } from 'vite'; export default defineConfig({ root: '.' });\n"
+        )
+        (root / "package.json").write_text(json.dumps({
+            "name": "lab",
+            "scripts": {"dev": "vite", "build": "vite build", "preview": "vite preview"},
+        }))
+        self.assertTrue(is_vite_app(root))
+        self.assertEqual(vite_config(root), "web/vite.config.ts")
+
+    def test_page_looks_loading_and_ready(self):
+        from demo_director.prepare import page_looks_loading
+
+        self.assertTrue(page_looks_loading("Loading the household…"))
+        self.assertTrue(page_looks_loading("Loading..."))
+        self.assertFalse(page_looks_loading(
+            "School Pulse\nTonight\nStudent A · Pinecrest Middle\nMath quiz due Friday"
+        ))
+
+    def test_seed_env_sets_foundry_and_school_pulse_data(self):
+        from demo_director.prepare import seed_env
+
+        root = Path(tempfile.mkdtemp())
+        (root / "fixtures").mkdir()
+        (root / "fixtures" / "planner-records.json").write_text("{}")
+        (root / "public").mkdir()
+        (root / "public" / "app.js").write_text("/* board */")
+        (root / "package.json").write_text(json.dumps({
+            "scripts": {"dashboard": "tsx src/server.ts", "demo": "node dist/cli.js demo"},
+        }))
+        env = seed_env(root, {})
+        self.assertEqual(env.get("FOUNDRY_SEED"), "1")
+        self.assertTrue(env.get("SCHOOL_PULSE_DATA", "").endswith(".demo-director-data"))
+
+    def test_npm_serve_prefers_demo_with_port(self):
+        from demo_director.prepare import _npm_serve_cmd
+
+        root = Path(tempfile.mkdtemp())
+        (root / "package.json").write_text(json.dumps({
+            "scripts": {
+                "demo": "node dist/src/cli.js demo",
+                "start": "node dist/src/cli.js serve",
+                "dev": "vite --port 4173",
+            },
+        }))
+        cmd = _npm_serve_cmd(root, 4611)
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd[:3], ["npm", "run", "demo"])
+        self.assertIn("--port", cmd)
+        self.assertIn("4611", cmd)
+
+    def test_vite_preview_cmd_includes_config_and_port(self):
+        from demo_director.prepare import _vite_preview_cmd
+
+        root = Path(tempfile.mkdtemp())
+        (root / "vite.config.ts").write_text("export default {}\n")
+        (root / "node_modules").mkdir()
+        (root / "package.json").write_text(json.dumps({
+            "scripts": {"build": "vite build", "preview": "vite preview"},
+        }))
+        cmd = _vite_preview_cmd(root, 4622)
+        self.assertIsNotNone(cmd)
+        self.assertIn("preview", cmd)
+        self.assertIn("4622", cmd)
+        self.assertIn("vite.config.ts", cmd)
+
+    def test_pick_free_port_in_band(self):
+        from demo_director.prepare import pick_free_port, release_port
+
+        port = pick_free_port(4600, 4699)
+        self.assertTrue(4600 <= port <= 4699)
+        release_port(port)

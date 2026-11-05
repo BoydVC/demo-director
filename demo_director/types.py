@@ -165,6 +165,8 @@ class BlankPolicy:
         r"nothing is (?:shown|guessed)",
         r"no calendar data",
         r"not valid json",
+        r"loading the household",
+        r"^loading\b",
         r"\bno\b[\w\s,'-]{0,40}\bon air\b",
         r"\bno\b[\w\s,'-]{0,40}\byet\b",
         r"\berror\b",

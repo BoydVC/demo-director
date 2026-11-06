@@ -1,11 +1,16 @@
 """Synthetic-data guard.
 
 Emails and phone numbers block. Names block when they are listed on the shot
-list (``deny_names``) or passed in by the caller. RFC 2606 reserved domains
+list (``deny_names``), passed in by the caller, or part of the built-in
+household and school denylist. ``effective_names`` always includes that
+denylist; an allow list cannot put those terms back. RFC 2606 reserved domains
 are synthetic and do not block: example.com, example.org, example.net (and
 their subdomains), plus any host under .test or .example. The guard fails
 closed: unreadable text, a non-string, or a denylist entry too short to match
 safely is a hit, and the render does not proceed.
+
+``reads_private_sources`` stays locked off. Nothing in this package reads
+tutor sheets or rebuilds an hspt bank from private sources.
 """
 from __future__ import annotations
 
@@ -87,11 +92,34 @@ def term_present(text: str, term: str) -> bool:
     return False
 
 
+# Closed household and school denylist. Whole-word, case-insensitive.
+# Synthetic fixtures use other names. This list is not operator config.
+FAMILY_TERMS: tuple[str, ...] = (
+    "Charlotte",
+    "Victor",
+    "Miranda",
+    "Boyd",
+    "Spalding",
+    "St. Mary",
+    "St Mary",
+    "Saint Mary",
+    "St.Mary",
+    "Char",
+    "Vic",
+)
+
+
+def reads_private_sources() -> bool:
+    """Always false. An environment variable cannot turn this on."""
+    return False
+
+
 def load_deny_terms() -> tuple[str, ...]:
     """Terms from ``DEMO_DIRECTOR_DENY`` and ``.demo-director/deny.txt``.
 
     One term per line. Blank lines and ``#`` comments are skipped. ``@handles``
     are kept as written. This file is operator config and is not part of the repo.
+    The built-in denylist is applied separately by ``effective_names``.
     """
     paths: list[Path] = []
     env = os.environ.get("DEMO_DIRECTOR_DENY")
@@ -111,6 +139,42 @@ def load_deny_terms() -> tuple[str, ...]:
             if term and term not in found:
                 found.append(term)
     return tuple(found)
+
+
+def effective_names(extra: Iterable[str] = (), allow: Iterable[str] = ()) -> tuple[str, ...]:
+    """Built-in denylist, then caller terms, then the operator deny file.
+
+    Allow entries drop caller and file terms. They do not drop the built-in
+    household and school denylist.
+    """
+    family_keys = {normalize_text(term) for term in FAMILY_TERMS}
+    allowed = {
+        normalize_text(part)
+        for part in allow
+        if isinstance(part, str) and part.strip()
+    }
+    allowed -= family_keys
+    found: list[str] = []
+    seen: set[str] = set()
+    for term in tuple(FAMILY_TERMS) + tuple(extra) + load_deny_terms():
+        if not isinstance(term, str) or not term.strip():
+            continue
+        token = " ".join(term.split())
+        key = normalize_text(token)
+        if not key or key in seen or key in allowed:
+            continue
+        seen.add(key)
+        found.append(token)
+    return tuple(found)
+
+
+def detail_has_name(detail: str) -> bool:
+    """True when a guard detail is a name hit, not ``name-policy`` or an email."""
+    for part in str(detail or "").split(","):
+        token = part.strip()
+        if token == "name" or token.startswith("name:"):
+            return True
+    return False
 
 
 def _title_words(title: str) -> set[str]:

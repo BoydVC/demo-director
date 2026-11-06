@@ -19,6 +19,8 @@ HELP = """usage: demo-director <shotlist.json> [-o DIR]
        demo-director init <url|README> [-o FILE]
        demo-director batch <dir-or-glob> [-o DIR]
        demo-director gallery <dir> [--screenshot FILE]
+       demo-director scrub list-blocked --summary FILE
+       demo-director scrub propose --set FILE --workdir DIR
 
 Synthetic data only. Refuses a real-looking email, a phone number, or a
 configured name. example.com, example.org, example.net, .test, and .example
@@ -46,6 +48,9 @@ def main(argv: list[str] | None = None) -> int:
         return _batch(args[1:])
     if cmd == "gallery":
         return _gallery(args[1:])
+    if cmd == "scrub":
+        from .scrub import main as scrub_main
+        return scrub_main(args[1:])
     return _render(args)
 
 

@@ -20,7 +20,8 @@ from pathlib import Path
 from PIL import Image
 
 from . import compose
-from .guard import hits, load_deny_terms, locate_denied, name_detail
+from .guard import effective_names, hits, locate_denied, name_detail
+from .showcase import choose_still_index, discard_showcase
 from .session import Phase, RecordingFailure, Session, StepSignals, run_step
 from .shotlist import ASPECTS, FIXTURE_URL
 from .types import Beat, BlankPolicy, Box, ShotList, step_selector, step_text
@@ -692,7 +693,7 @@ def record(sl: ShotList) -> list[Beat]:
     from playwright.sync_api import sync_playwright
 
     sl = resolve_fixture(sl)
-    names = tuple(dict.fromkeys(tuple(sl.pii.names) + load_deny_terms()))
+    names = effective_names(sl.pii.names)
     captions = _caption_texts(sl)
     session = Session.idle()
     blob = hits(shotlist_blob(sl), ())
@@ -747,7 +748,7 @@ def record(sl: ShotList) -> list[Beat]:
                         )
                         if named:
                             raise _name_failure(named, index)
-                        reasons = hits(later, ())
+                        reasons = hits(f"{later_visible}\n{later_source}", ())
                         detail = ",".join(reasons) or "pii"
                     elif session.failure == "nav-error":
                         detail = "navigation"
@@ -934,6 +935,10 @@ def encode(frames_dir: str, fps: int, gif: str, mp4: str | None) -> None:
 
 def _write(sl: ShotList, beats: list, outdir: str, scale: float, fps: int) -> dict:
     subtitle = lead_line(sl)
+    names = effective_names(sl.pii.names)
+    named = locate_denied(names, title=sl.title, captions=_caption_texts(sl))
+    if named:
+        raise _name_failure(named)
     results = {}
     for aspect in sl.aspects:
         width, height = ASPECTS[aspect.value]
@@ -954,8 +959,11 @@ def _write(sl: ShotList, beats: list, outdir: str, scale: float, fps: int) -> di
             mp4 = os.path.join(outdir, f"demo-{slug}.mp4")
             encode(tmp, fps, gif, mp4)
             total = len(frames)
-            content = max(0, total - TITLE_FRAMES - END_FRAMES)
-            still_index = min(total - 1, TITLE_FRAMES + max(0, content - 1))
+            title_frames = TITLE_FRAMES if sl.title else 0
+            end_frames = END_FRAMES if sl.title else 0
+            still_index = choose_still_index(total, title_frames, end_frames)
+            if still_index is None:
+                raise _name_failure(("blocked:still",))
             still = os.path.join(outdir, f"still-{slug}.png")
             shutil.copy(os.path.join(tmp, f"f{still_index:05d}.png"), still)
             results[aspect.value] = {
@@ -1008,18 +1016,26 @@ def _empty_body(beats: list[Beat]) -> str | None:
 
 
 def direct(sl: ShotList, outdir: str, scale: float = 0.6, budget: int | None = None) -> dict:
-    """Record once. When ``budget`` is set, re-encode over-budget GIFs at a lower fps or scale."""
+    """Record once. When ``budget`` is set, re-encode over-budget GIFs at a lower fps or scale.
+
+    A name-gate failure deletes any GIF, still, or gallery page already in
+    ``outdir`` so a blocked take cannot remain the showcase pick.
+    """
     os.makedirs(outdir, exist_ok=True)
-    beats = record(sl)
-    empty = _empty_body(beats)
-    if empty:
-        raise RecordingFailure("blank-page", -1, empty, warning=f"page is not demoable: {empty}")
-    plan = fallback_plan(scale, sl.fps) if budget is not None else [(float(scale), int(sl.fps))]
-    results: dict = {}
-    for attempt, (s, fps) in enumerate(plan, start=1):
-        results = _write(sl, beats, outdir, s, fps)
-        for row in results.values():
-            row["attempts"] = attempt
-        if budget is None or _under_budget(results, budget):
-            return results
-    return results
+    try:
+        beats = record(sl)
+        empty = _empty_body(beats)
+        if empty:
+            raise RecordingFailure("blank-page", -1, empty, warning=f"page is not demoable: {empty}")
+        plan = fallback_plan(scale, sl.fps) if budget is not None else [(float(scale), int(sl.fps))]
+        results: dict = {}
+        for attempt, (s, fps) in enumerate(plan, start=1):
+            results = _write(sl, beats, outdir, s, fps)
+            for row in results.values():
+                row["attempts"] = attempt
+            if budget is None or _under_budget(results, budget):
+                return results
+        return results
+    except RecordingFailure:
+        discard_showcase(outdir)
+        raise

@@ -5,7 +5,8 @@ The set file is one ``repo group`` pair per line. Deny terms come from
 ``--deny`` (passed through as ``DEMO_DIRECTOR_DENY``) and are never stored
 in this script. After a render reports ok, the page is replayed the way a
 leak check would: title, captions, visible text, and click steps. A denied
-term there is ``name-leak``, not ok.
+term there is a name block: the GIF and stills are deleted and the bucket is
+``name-blocked``.
 
 Each repo is written to ``<workdir>/status/<repo>.json``. The summary counts
 are the bucket tally of those files in set-file order, so a second read of
@@ -32,6 +33,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from demo_director.guard import detail_has_name, effective_names, name_detail, term_present
+from demo_director.showcase import discard_showcase
+
 SKIP_DIRS = {".git", "node_modules", "vendor"}
 
 from demo_director.prepare import pick_free_port, prepare_and_serve  # noqa: E402
@@ -175,11 +179,18 @@ def _bucket(status: str, detail: str) -> str:
         return "ok"
     if status == "blank-page" or "blank-page" in detail:
         return "blank"
-    if status == "pii-blocked" and "name:" in detail:
+    if status in {"name-leak", "name-blocked"} or (
+        status == "pii-blocked" and ("name:" in detail or detail_has_name(detail))
+    ):
         return "name-blocked"
-    if status == "name-leak":
-        return "name-leak"
     return "other"
+
+
+def block_replay(terms: list[str], outdir: Path) -> dict:
+    """A replay hit is a blocked render. Showcase files are deleted, not kept."""
+    discard_showcase(outdir)
+    detail = name_detail(tuple(f"{term}:replay" for term in terms))
+    return {"status": "pii-blocked", "detail": detail, "bucket": "name-blocked", "leaked": list(terms)}
 
 
 def _run(cmd: list[str], env: dict, timeout: int, cwd: Path | None = None) -> tuple[int, str, str]:
@@ -202,8 +213,6 @@ def _run(cmd: list[str], env: dict, timeout: int, cwd: Path | None = None) -> tu
 def _replay(shot: dict, terms: tuple[str, ...], port: int) -> list[str]:
     """Visible text plus the title card and captions. Word-boundary match."""
     from playwright.sync_api import sync_playwright
-
-    from demo_director.guard import term_present
 
     url = re.sub(r"127\.0\.0\.1:\d+", f"127.0.0.1:{port}", str(shot.get("url", "")))
     chunks = [str(shot.get("title") or "")]
@@ -304,22 +313,19 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
         row["title"] = str(item.get("title") or row["title"])
         if status == "ok":
             try:
-                terms = tuple(
+                file_terms = tuple(
                     line.split("#", 1)[0].strip()
                     for line in Path(deny).read_text().splitlines()
                     if line.split("#", 1)[0].strip()
                 )
-                leaked = _replay(payload, terms, port)
+                leaked = _replay(payload, effective_names(file_terms), port)
             except Exception as exc:
                 row["status"] = "other"
                 row["detail"] = f"replay failed: {type(exc).__name__}"
                 row["bucket"] = "other"
                 return row
             if leaked:
-                row["status"] = "name-leak"
-                row["detail"] = "denied term in replayed text"
-                row["leaked"] = leaked
-                row["bucket"] = "name-leak"
+                row.update(block_replay(leaked, outdir))
                 return row
         row["status"] = status
         row["detail"] = detail

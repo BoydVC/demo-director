@@ -15,7 +15,7 @@ from dataclasses import replace
 
 from .director import direct
 from .gallery import write_gallery
-from .guard import derive_names, load_deny_terms
+from .guard import derive_names, effective_names
 from .propose import readme_near
 from .session import RecordingFailure
 from .shotlist import ShotListError, load
@@ -85,13 +85,11 @@ def _render_one(path: str, outdir: str, scale: float, budget: int,
         item["status"] = "error"
         item["error"] = str(exc)
         return item
-    allow = {part.casefold() for part in allow_names}
-    deny = [term for term in tuple(sl.pii.names) + tuple(extra_names) + load_deny_terms()
-            if term.casefold() not in allow]
+    deny = list(tuple(sl.pii.names) + tuple(extra_names))
     if derive:
-        derived = derive_names(readme_near(pathlib.Path(path).parent) + "\n" + sl.title, sl.title)
-        deny.extend(term for term in derived if term.casefold() not in allow and term not in deny)
-    sl = replace(sl, pii=PiiPolicy(names=tuple(deny), allow=tuple(allow_names)))
+        deny.extend(derive_names(readme_near(pathlib.Path(path).parent) + "\n" + sl.title, sl.title))
+    names = effective_names(deny, allow_names)
+    sl = replace(sl, pii=PiiPolicy(names=names, allow=tuple(allow_names)))
     item["title"] = sl.title
     try:
         rendered = direct(sl, outdir, scale, budget)

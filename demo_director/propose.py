@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlparse
 
-from .guard import derive_names, hits, load_deny_terms, locate_denied, name_detail
+from .guard import derive_names, effective_names, hits, locate_denied, name_detail
 from .session import RecordingFailure
 from .shotlist import FIXTURE_URL, dump
 from .types import (
@@ -283,21 +283,17 @@ def readme_near(start: pathlib.Path) -> str:
 
 
 def _deny_terms(extra: tuple[str, ...] = (), readme: str = "", title: str = "",
-               derive: bool = False) -> tuple[str, ...]:
-    """Explicit deny names, the deny file, and optional ``for First Last`` hits.
+               derive: bool = False, allow: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Explicit deny names, the deny file, the built-in denylist, and optional derivations.
 
     Derived words that are already in ``title`` are dropped so a repo title
-    cannot block itself. Derivation is off unless the caller asks.
+    cannot block itself. Derivation is off unless the caller asks. Allow
+    entries cannot remove the built-in household and school denylist.
     """
-    terms: list[str] = []
-    for term in tuple(extra) + load_deny_terms():
-        if term and term not in terms:
-            terms.append(term)
+    terms = list(extra)
     if derive:
-        for term in derive_names(readme + "\n" + title, title):
-            if term not in terms:
-                terms.append(term)
-    return tuple(terms)
+        terms.extend(derive_names(readme + "\n" + title, title))
+    return effective_names(terms, allow)
 
 
 def _refuse_denied(terms: tuple[str, ...], *, page: str = "", title: str = "",
@@ -552,9 +548,7 @@ def from_page(url: str, fallback: str = "Demo", slug: str = "",
     chosen = resolve_title(page.heading, page.document_title, slug or fallback)
     if not page.heading and not page.document_title:
         chosen = display_title(page.title or fallback, slug or fallback)
-    terms = _deny_terms(deny_names, readme, chosen, derive)
-    allowed = {part.casefold() for part in allow_names}
-    terms = tuple(term for term in terms if term.casefold() not in allowed)
+    terms = _deny_terms(deny_names, readme, chosen, derive, allow_names)
     _refuse_denied(terms, page=text, title=chosen, captions=(chosen,))
     return draft_from(chosen, _portable(url), (), page, results)
 
@@ -572,18 +566,14 @@ def from_readme(path: pathlib.Path, slug: str = "", allow_names: tuple[str, ...]
         if not headings:
             raise ShotListError(f"no headings in {path}")
         title = display_title(headings[0], slug)
-        terms = _deny_terms(deny_names, text, title, derive)
-        allowed = {part.casefold() for part in allow_names}
-        terms = tuple(term for term in terms if term.casefold() not in allowed)
+        terms = _deny_terms(deny_names, text, title, derive, allow_names)
         _refuse_denied(terms, title=title, captions=(title, *headings[1:]))
         return draft_from(title, FIXTURE_URL, (title, *headings[1:]), None)
     page, results, page_text = probe(url)
     _refuse(page_text)
     raw = headings[0] if headings else page.title
     title = display_title(raw, slug or path.parent.name)
-    terms = _deny_terms(deny_names, text, title, derive)
-    allowed = {part.casefold() for part in allow_names}
-    terms = tuple(term for term in terms if term.casefold() not in allowed)
+    terms = _deny_terms(deny_names, text, title, derive, allow_names)
     shown = (title, *headings[1:]) if headings else ()
     _refuse_denied(terms, page=page_text, title=title, captions=shown or (title,))
     return draft_from(title, _portable(url), shown, page, results)

@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+from .showcase import folder_hidden, heading_blocked
+
 ASPECTS = ("16:9", "1:1", "9:16")
 _ORDER = {"16:9": 0, "1:1": 1, "9:16": 2}
 
@@ -163,7 +165,9 @@ def render_html(title: str, sections: list[tuple[str, list[dict]]], page_path: s
 """
 
 
-def _items_from_folder(folder: str, report: dict | None) -> list[dict]:
+def _items_from_folder(folder: str, report: dict | None, *, own_report: bool = False) -> list[dict]:
+    if folder_hidden(folder, report, own_report=own_report):
+        return []
     by_aspect = {}
     if report:
         for item in report.get("items") or []:
@@ -208,19 +212,21 @@ def write_gallery(outdir: str, title: str = "Demo Director", report: dict | None
     page = os.path.join(outdir, "index.html")
     root_report = report if report is not None else _read_report(outdir)
     sections: list[tuple[str, list[dict]]] = []
-    root_items = _items_from_folder(outdir, root_report)
+    root_items = _items_from_folder(outdir, root_report, own_report=True)
     if root_items:
         heading = title
         if root_report and len(root_report.get("items") or []) == 1:
             heading = root_report["items"][0].get("title") or title
-        sections.append((heading, root_items))
+        if not heading_blocked(heading):
+            sections.append((heading, root_items))
     if os.path.isdir(outdir):
         for name in sorted(os.listdir(outdir)):
             folder = os.path.join(outdir, name)
             if not os.path.isdir(folder):
                 continue
-            sub_report = _read_report(folder) or root_report
-            items = _items_from_folder(folder, sub_report)
+            own = _read_report(folder)
+            sub_report = own or root_report
+            items = _items_from_folder(folder, sub_report, own_report=own is not None)
             if not items:
                 continue
             heading = name
@@ -233,9 +239,12 @@ def write_gallery(outdir: str, title: str = "Demo Director", report: dict | None
                     if gif and os.path.abspath(os.path.dirname(gif)) == os.path.abspath(folder):
                         heading = item.get("title") or heading
                         break
-            sections.append((heading, items))
+            if not heading_blocked(heading):
+                sections.append((heading, items))
     if len(sections) == 1:
         title = sections[0][0]
+    if heading_blocked(title):
+        title = "Demo"
     Path(page).write_text(render_html(title, sections, page))
     return page
 

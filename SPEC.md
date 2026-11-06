@@ -15,7 +15,7 @@ Every BoydVC delivery must ship an animated demo GIF (synthetic data only). Toda
 ## v1 goals for the arena
 1. **Auto-shotlist**: `demo-director init <url|README>` proposes a shot list from visible buttons/inputs and README headings.
 2. **Smart framing**: zoom keeps the whole target *and* its label visible (prototype can crop left text, see `shots/still-16x9.png`); safe-area aware for 9:16 captions.
-3. **Synthetic-data guard**: refuse to render if the page text matches a PII denylist (emails, phone numbers, configurable names). Fail closed.
+3. **Synthetic-data guard**: refuse to render if the page text matches a PII denylist (emails, phone numbers, configurable names, and the built-in household and school names). Fail closed. A blocked render is not written into a showcase GIF, still, or gallery pick.
 4. **Batch mode**: `demo-director batch demos/*.json` with a JSON report (frames, bytes, duration) and size budget (GIF ≤ 5 MB for X).
 5. **Gallery**: static `index.html` showing every output side by side.
 6. **CI**: GitHub Action that renders on push and uploads artifacts. No posting anywhere, ever.

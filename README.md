@@ -10,6 +10,21 @@ python -m demo_director examples/weekend-planner.json -o shots   # set "url" to 
 ```
 See SPEC.md.
 
+## Committed fixtures for fleet demos
+
+Fleet demos must use the scrubbed bytes already committed under `data/`, `web/`, and `dist/`. Live collect is for private local use only. Re-running `collect.py`, `build.py`, `export_snapshot.py`, `npm run build`, or a server that rebuilds those trees on start re-ingests dirty box caches (`/workspace/tokenmax`, including newspaper PDFs, and `/home/box/agent-data` profiles) and overwrites the scrubbed checkout.
+
+`scripts/fleet_check.py` and `prepare_and_serve` default to committed fixtures. Unset `DEMO_DIRECTOR_FIXTURES` means on, as does `--prefer-committed-fixtures`. That path does not run those rewrite hooks and does not start a process whose source would rewrite the committed trees. A server that only reads the committed files still starts. Local CSS/JS placeholders are still inlined from siblings already in the checkout.
+
+Opt into live collect only on a private machine:
+
+```bash
+DEMO_DIRECTOR_FIXTURES=0 python scripts/fleet_check.py --set repos.txt --deny deny.txt --org BoydVC
+python scripts/fleet_check.py --live-collect --set repos.txt --deny deny.txt --org BoydVC
+```
+
+`0`, `false`, `no`, `off`, and `live` turn the env var off. Any other value stays on. `--prefer-committed-fixtures` forces the safe path even when the env var is off. The household-name gate still fail-closes after the page is served.
+
 ## Family-name gate
 
 A render that would show a built-in household or school name is blocked before any GIF, still, or gallery pick is written. An allow list cannot turn those terms back on. `reads_private_sources` stays off: the scrub tools do not open tutor sheets or an hspt bank, and they refuse KPD and law repos.

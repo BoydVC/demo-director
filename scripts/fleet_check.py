@@ -10,11 +10,16 @@ term there is a name block: the GIF and stills are deleted and the bucket is
 
 Each repo is written to ``<workdir>/status/<repo>.json``. The summary counts
 are the bucket tally of those files in set-file order, so a second read of
-the same files reproduces the counts. ``build.py`` is run when present,
-which fills pages that are still templates; a runner that serves the
-template instead will count those repos as blank rather than ok or
-name-blocked. A page whose copy is filled from data that is not in the
-checkout can also disagree.
+the same files reproduces the counts.
+
+Fleet demos default to scrubbed committed ``data/``, ``web/``, and ``dist/``.
+``collect.py``, ``build.py``, ``export_snapshot.py``, and a server that
+rebuilds those trees from live box caches are not run. ``--live-collect``
+(or ``DEMO_DIRECTOR_FIXTURES=0``) opts into those hooks for private local
+use. A runner that serves an unfilled template instead will count those
+repos as blank rather than ok or name-blocked. A page whose copy is filled
+from data that is not in the checkout can also disagree. The household-name
+gate still fail-closes after the page is served.
 """
 from __future__ import annotations
 
@@ -38,7 +43,11 @@ from demo_director.showcase import discard_showcase
 
 SKIP_DIRS = {".git", "node_modules", "vendor"}
 
-from demo_director.prepare import pick_free_port, prepare_and_serve  # noqa: E402
+from demo_director.prepare import (  # noqa: E402
+    pick_free_port,
+    prepare_and_serve,
+    use_committed_fixtures,
+)
 
 
 def _read_set(path: Path) -> list[tuple[str, str]]:
@@ -243,7 +252,7 @@ def _replay(shot: dict, terms: tuple[str, ...], port: int) -> list[str]:
 
 def check_repo(repo: str, group: str, org: str, work: str, deny: str,
                scale: float, port: int, src_root: str | None = None,
-               allow_clone: bool = False) -> dict:
+               allow_clone: bool = False, prefer_committed_fixtures: bool = True) -> dict:
     row: dict = {"repo": repo, "group": group, "status": "other", "detail": "", "title": ""}
     if port <= 0:
         port = pick_free_port(4600, 4699)
@@ -253,6 +262,7 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
         root = Path(work) / "src" / repo
     env = os.environ.copy()
     env["DEMO_DIRECTOR_DENY"] = deny
+    env["DEMO_DIRECTOR_FIXTURES"] = "1" if prefer_committed_fixtures else "0"
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
     if not root.is_dir():
@@ -270,9 +280,11 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
             row["bucket"] = "other"
             row["stderr"] = err[-400:]
             return row
-    # Build hooks (build.py, export_static.py, …) then prefer server.py / npm.
+    # Committed fixtures (default) skip live collect/build. --live-collect opts in.
     try:
-        server, built_names = prepare_and_serve(root, port, env=env)
+        server, built_names = prepare_and_serve(
+            root, port, env=env, prefer_committed_fixtures=prefer_committed_fixtures,
+        )
     except Exception as exc:
         row["detail"] = f"serve failed: {type(exc).__name__}: {exc}"
         row["bucket"] = "other"
@@ -337,7 +349,7 @@ def check_repo(repo: str, group: str, org: str, work: str, deny: str,
         server.stop()
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Render a repo set and summarize guard results")
     ap.add_argument("--set", required=True, type=Path)
     ap.add_argument("--deny", required=True, type=Path)
@@ -354,7 +366,35 @@ def main(argv: list[str] | None = None) -> int:
                     help="Directory of already-extracted repo checkouts (no git clone)")
     ap.add_argument("--allow-clone", action="store_true",
                     help="Permit git clone when a repo is missing under --src-root/work")
-    args = ap.parse_args(argv)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--prefer-committed-fixtures",
+        dest="fixtures_cli",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Serve scrubbed committed data/web/dist and skip live collect/build (default).",
+    )
+    mode.add_argument(
+        "--no-prefer-committed-fixtures",
+        "--live-collect",
+        dest="fixtures_cli",
+        action="store_const",
+        const=False,
+        help="Re-run collect/build/export from live caches. Private local use only.",
+    )
+    return ap
+
+
+def fixtures_from_args(args: argparse.Namespace, env: dict | None = None) -> bool:
+    """CLI flag wins. Otherwise ``DEMO_DIRECTOR_FIXTURES``, default on."""
+    source = os.environ if env is None else env
+    return use_committed_fixtures(source, args.fixtures_cli)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    fixtures = fixtures_from_args(args)
     rows = _read_set(args.set)
     if args.only:
         wanted = set(args.only)
@@ -414,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
                 str(args.deny), args.scale, 0,
                 str(args.src_root) if args.src_root else None,
                 bool(args.allow_clone),
+                fixtures,
             ): repo
             for repo, group, index in pending
         }

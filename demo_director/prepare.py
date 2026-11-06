@@ -2,11 +2,19 @@
 
 BoydVC apps often ship as an unfilled ``web/index.html`` plus ``build.py``,
 ``export_static.py``, or a small ``server.py`` that serves ``/api/*``. A plain
-``python -m http.server`` of the checkout then looks blank. This module runs
-the common build hooks, prefers a baked ``dist/`` snapshot when one appears,
-and starts ``server.py`` / ``npm start`` / Vite preview when the page needs a
-local API. Vite apps get ``npm ci`` + ``npm run build`` + ``vite preview``.
-Seedable dashboards get fixture env (``FOUNDRY_SEED``) or a ``demo`` script.
+``python -m http.server`` of the checkout then looks blank.
+
+Fleet demos default to committed fixtures (``DEMO_DIRECTOR_FIXTURES`` unset
+or ``1``). Scrubbed ``data/``, ``web/``, and ``dist/`` are served as
+committed. ``collect.py``, ``build.py``, ``export_snapshot.py``, ``npm run
+build``, and a server that would rebuild those trees from live box caches
+are not run. ``DEMO_DIRECTOR_FIXTURES=0`` (or
+``prefer_committed_fixtures=False``) opts into that live collect for private
+local use: the common build hooks run, a baked ``dist/`` snapshot is
+preferred when one appears, and ``server.py`` / ``npm start`` / Vite preview
+start when the page needs a local API. Vite apps then get ``npm ci`` +
+``npm run build`` + ``vite preview``. Seedable dashboards get fixture env
+(``FOUNDRY_SEED``) or a ``demo`` script.
 """
 from __future__ import annotations
 
@@ -32,6 +40,22 @@ PRIVATE_PATH_MARKERS = (
     "HQ_HSPT_ROOT",
 )
 
+# Live box caches. ``/workspace/tokenmax`` covers newspaper PDFs under that tree.
+# A hit means "starting this process would re-ingest dirty data", not "skip in
+# live-collect mode" — live collect keeps the previous hook behavior.
+LIVE_CACHE_MARKERS = (
+    "/workspace/tokenmax",
+    "/workspace/hspt",
+    "/home/box/agent-data",
+    "agent-data",
+    "/cursor/stores/",
+    "HQ_HSPT_ROOT",
+)
+
+FIXTURES_ENV = "DEMO_DIRECTOR_FIXTURES"
+# Explicit opt-in to live collect. Anything else, including unset, stays on.
+_FIXTURES_OFF = frozenset({"0", "false", "no", "off", "live"})
+
 
 def reads_private_sources(path: Path) -> bool:
     """True when a script would rebuild from private box files (e.g. HSPT sheets)."""
@@ -50,8 +74,167 @@ def reads_private_sources(path: Path) -> bool:
     return False
 
 
+def _read_head(path: Path, limit: int = 80_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
+    except OSError:
+        return ""
+
+
+def use_committed_fixtures(env: dict | None = None, flag: bool | None = None) -> bool:
+    """True when demos must serve committed ``data/``, ``web/``, and ``dist/``.
+
+    An explicit ``flag`` wins. Otherwise ``DEMO_DIRECTOR_FIXTURES`` is read
+    from ``env`` (or ``os.environ`` when ``env`` is None). Unset is on, so a
+    fleet render fail-closes toward scrubbed bytes. ``0``, ``false``, ``no``,
+    ``off``, and ``live`` opt into live collect.
+    """
+    if flag is not None:
+        return bool(flag)
+    source = os.environ if env is None else env
+    raw = source.get(FIXTURES_ENV)
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in _FIXTURES_OFF
+
+
+_REWRITE_SCRIPT_RE = re.compile(
+    r"(?:^|[\s'\"`(=/])(?:collect|build_data|build_snapshot|build|export_static|export_snapshot|render)\.py\b"
+)
+_COLLECT_IMPORT_RE = re.compile(
+    r"(?m)^\s*(?:import|from)\s+(?:collect|export_snapshot|export_static|build_data|build_snapshot)\b"
+)
+_LAUNCH_RE = re.compile(
+    r"\b(?:subprocess|Popen|os\.system|run_path|check_call|check_output"
+    r"|child_process|execSync|execFile|spawnSync)\b|\bexec\b|\bspawn\b"
+)
+
+
+def text_rewrites_committed_caches(text: str) -> bool:
+    """True when a source file would rebuild committed trees on import or start.
+
+    A comment that merely names ``build.py`` does not count. A live-cache path,
+    an import of a collector, or a launcher plus a rewrite script does.
+    """
+    if not text:
+        return False
+    if any(marker in text for marker in LIVE_CACHE_MARKERS):
+        return True
+    if _COLLECT_IMPORT_RE.search(text):
+        return True
+    if _REWRITE_SCRIPT_RE.search(text) and _LAUNCH_RE.search(text):
+        return True
+    return False
+
+
+def command_text_rewrites(text: str) -> bool:
+    """True when a command line or npm script itself runs a rewrite or live cache."""
+    if not text:
+        return False
+    if any(marker in text for marker in LIVE_CACHE_MARKERS):
+        return True
+    return _REWRITE_SCRIPT_RE.search(text) is not None
+
+
+def server_rebuilds_on_start(path: Path, *, _seen: set[Path] | None = None, _depth: int = 0) -> bool:
+    """True when launching ``path`` would rewrite ``data/``, ``web/``, or ``dist/``."""
+    if _depth > 2 or not path.is_file():
+        return False
+    seen = _seen if _seen is not None else set()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if resolved in seen:
+        return False
+    seen.add(resolved)
+    text = _read_head(path)
+    if text_rewrites_committed_caches(text):
+        return True
+    if _depth >= 2:
+        return False
+    for name in re.findall(r"(?:import|from)\s+([A-Za-z_][\w]*)", text):
+        sibling = path.parent / f"{name}.py"
+        if sibling.is_file() and server_rebuilds_on_start(sibling, _seen=seen, _depth=_depth + 1):
+            return True
+    return False
+
+
+def command_rewrites_on_start(root: Path, cmd: list[str]) -> bool:
+    """True when ``cmd`` (or the local program it names) rebuilds committed caches."""
+    blob = " ".join(cmd)
+    scripts = npm_scripts(root)
+    if cmd and cmd[0] == "npm":
+        if "run" in cmd:
+            idx = cmd.index("run")
+            if idx + 1 < len(cmd):
+                blob += "\n" + scripts.get(cmd[idx + 1], "")
+        if "start" in cmd[:3]:
+            blob += "\n" + scripts.get("start", "")
+    if command_text_rewrites(blob):
+        return True
+    files: list[Path] = []
+    for part in list(cmd) + re.findall(r"[\w./-]+\.(?:py|js|mjs|cjs|ts)", blob):
+        candidate = Path(part)
+        if not candidate.is_file():
+            candidate = root / part
+        if not candidate.is_file():
+            continue
+        if "node_modules" in candidate.parts:
+            continue
+        try:
+            if not candidate.resolve().is_relative_to(root.resolve()):
+                continue
+        except OSError:
+            continue
+        files.append(candidate)
+    seen: set[Path] = set()
+    for candidate in files:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if len(seen) > 8:
+            break
+        if candidate.suffix == ".py":
+            # Python uses the tight detector so a comment that names build.py
+            # does not sideline an API server. Imports are followed.
+            if server_rebuilds_on_start(candidate):
+                return True
+            continue
+        head = _read_head(candidate)
+        # JS/TS entrypoints are the command. A rewrite script name or a live
+        # cache path in the file is enough; they have no Python launcher word.
+        if text_rewrites_committed_caches(head) or command_text_rewrites(head):
+            return True
+    return False
+
+
+def stage_committed_data(root: Path) -> None:
+    """Copy committed ``data/*.json`` into ``web/`` only when that file is absent.
+
+    Never overwrites a scrubbed ``web/`` file.
+    """
+    import shutil
+
+    web = root / "web"
+    data = root / "data"
+    if not web.is_dir() or not data.is_dir():
+        return
+    for src in data.glob("*.json"):
+        dest = web / src.name
+        if not dest.exists():
+            shutil.copy2(src, dest)
+
+
 # Order matters: data builders first, then page builders, then offline snapshots.
+# ``collect.py`` is the live-cache ingest some apps run directly (others call it
+# from ``build.py``). Fixtures mode skips this whole list.
 BUILD_SCRIPTS = (
+    "collect.py",
     "build_data.py",
     "build.py",
     "build_snapshot.py",
@@ -284,11 +467,30 @@ def fill_html_placeholders(root: Path) -> list[str]:
     return rewritten
 
 
-def run_build_hooks(root: Path, env: dict | None = None, timeout: int = 90) -> list[str]:
-    """Run known seed/build/export scripts. Returns the names that exited 0."""
+def run_build_hooks(
+    root: Path,
+    env: dict | None = None,
+    timeout: int = 90,
+    *,
+    prefer_committed_fixtures: bool | None = None,
+) -> list[str]:
+    """Run known seed/build/export scripts. Returns the names that exited 0.
+
+    When committed fixtures are on (the default), rewrite scripts and
+    ``npm run build`` are skipped so live caches cannot replace scrubbed
+    ``data/``, ``web/``, or ``dist/``. Sibling CSS/JS placeholders are still
+    inlined from files already in the checkout.
+    """
     env = dict(env or os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
+    fixtures = use_committed_fixtures(env, prefer_committed_fixtures)
+    env[FIXTURES_ENV] = "1" if fixtures else "0"
     ran: list[str] = []
+    if fixtures:
+        filled = fill_html_placeholders(root)
+        if filled:
+            ran.append("fill:placeholders")
+        return ran
     (root / "dist").mkdir(parents=True, exist_ok=True)
     for name in BUILD_SCRIPTS:
         script = root / name
@@ -607,14 +809,29 @@ def _npm_serve_cmd(root: Path, port: int) -> list[str] | None:
     return None
 
 
-def start_server(root: Path, port: int, entry: str | None = None) -> RunningServer:
-    """Start the best local server for ``root`` and return how to open it."""
+def start_server(
+    root: Path,
+    port: int,
+    entry: str | None = None,
+    *,
+    prefer_committed_fixtures: bool | None = None,
+) -> RunningServer:
+    """Start the best local server for ``root`` and return how to open it.
+
+    Committed-fixtures mode does not launch a server that would rewrite
+    ``data/``, ``web/``, or ``dist/`` on start. Those checkouts fall through
+    to the committed HTML snapshot.
+    """
     env = _port_env(port, root)
+    fixtures = use_committed_fixtures(env, prefer_committed_fixtures)
+    env[FIXTURES_ENV] = "1" if fixtures else "0"
     if entry is None:
         entry = find_entry(root)
 
     server_py = root / "server.py"
-    if server_py.is_file() and not reads_private_sources(server_py):
+    rebuilds = bool(server_py.is_file() and fixtures and server_rebuilds_on_start(server_py))
+    private = bool(server_py.is_file() and reads_private_sources(server_py))
+    if server_py.is_file() and not private and not rebuilds:
         proc = _spawn([sys.executable, "server.py"], root, env)
         if wait_port(port, timeout=15):
             url = f"http://127.0.0.1:{port}/"
@@ -624,19 +841,14 @@ def start_server(root: Path, port: int, entry: str | None = None) -> RunningServ
             _stop_proc(proc)
         else:
             _stop_proc(proc)
-    elif server_py.is_file() and reads_private_sources(server_py):
+    elif private or rebuilds:
         # Stage checked-in JSON next to the static web UI so http.server can
-        # satisfy /bank.json without rebuilding from private sheets.
-        import shutil
-        web = root / "web"
-        data = root / "data"
-        if web.is_dir() and data.is_dir():
-            for src in data.glob("*.json"):
-                dest = web / src.name
-                if not dest.is_file():
-                    shutil.copy2(src, dest)
+        # satisfy /bank.json without rebuilding from private sheets or live caches.
+        stage_committed_data(root)
 
     npm_cmd = _npm_serve_cmd(root, port)
+    if npm_cmd is not None and fixtures and command_rewrites_on_start(root, npm_cmd):
+        npm_cmd = None
     if npm_cmd is not None:
         needs_modules = npm_cmd[0] in {"npm", "npx", "tsx"} or (
             npm_cmd[0] == "node" and not (root / "node_modules").is_dir() and "node_modules" in " ".join(npm_cmd)
@@ -657,9 +869,10 @@ def start_server(root: Path, port: int, entry: str | None = None) -> RunningServ
 
     vite_cmd = _vite_preview_cmd(root, port)
     if vite_cmd is not None:
-        # Ensure a build exists before preview.
-        if not find_entry(root) or is_vite_app(root):
-            if "npm:build" not in run_build_hooks(root, env=env):
+        # Live collect may bake a preview bundle. Fixtures mode keeps the
+        # committed dist and must not run ``npm run build`` here.
+        if not fixtures and (not find_entry(root) or is_vite_app(root)):
+            if "npm:build" not in run_build_hooks(root, env=env, prefer_committed_fixtures=False):
                 # Still try preview if web/dist or dist already has html.
                 pass
         proc = _spawn(vite_cmd, root, env)
@@ -687,15 +900,29 @@ def start_server(root: Path, port: int, entry: str | None = None) -> RunningServ
     return RunningServer(proc, port, f"http://127.0.0.1:{port}/{rel}", "http.server", entry)
 
 
-def prepare_and_serve(root: Path, port: int, env: dict | None = None) -> tuple[RunningServer, list[str]]:
-    """Build hooks, then start a server. Caller must ``server.stop()``."""
+def prepare_and_serve(
+    root: Path,
+    port: int,
+    env: dict | None = None,
+    *,
+    prefer_committed_fixtures: bool | None = None,
+) -> tuple[RunningServer, list[str]]:
+    """Serve ``root``. Caller must ``server.stop()``.
+
+    Committed fixtures are the default: collect/build/export hooks that
+    rewrite ``data/``, ``web/``, or ``dist/`` do not run. Pass
+    ``prefer_committed_fixtures=False`` or set ``DEMO_DIRECTOR_FIXTURES=0``
+    to opt into live collect.
+    """
     merged = _port_env(port, root)
     if env:
         merged.update(env)
         merged = seed_env(root, merged)
-    built = run_build_hooks(root, env=merged)
+    fixtures = use_committed_fixtures(merged, prefer_committed_fixtures)
+    merged[FIXTURES_ENV] = "1" if fixtures else "0"
+    built = run_build_hooks(root, env=merged, prefer_committed_fixtures=fixtures)
     entry = find_entry(root)
-    server = start_server(root, port, entry=entry)
+    server = start_server(root, port, entry=entry, prefer_committed_fixtures=fixtures)
     return server, built
 
 

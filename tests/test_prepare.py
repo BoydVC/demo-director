@@ -1,11 +1,17 @@
 """Build/serve detection for fleet checkouts."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
 import socket
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from demo_director.prepare import find_entry, run_build_hooks, start_server, wait_port
 
@@ -35,7 +41,7 @@ class PrepareTests(unittest.TestCase):
             "(root / 'dist' / 'snap.html').write_text("
             "'<!doctype html><title>Snap</title><body>offline snap content</body>')\n"
         )
-        ran = run_build_hooks(root)
+        ran = run_build_hooks(root, prefer_committed_fixtures=False)
         self.assertIn("export_static.py", ran)
         self.assertTrue((root / "dist" / "snap.html").is_file())
         self.assertEqual(find_entry(root), "dist/snap.html")
@@ -193,7 +199,7 @@ class PrivateRebuildTests(unittest.TestCase):
             "Path(\"dist/ok.html\").write_text(\"<!doctype html><title>Ok</title><body>offline demo content here</body>\")\n"
         )
         self.assertTrue(reads_private_sources(root / "build_bank.py"))
-        ran = run_build_hooks(root)
+        ran = run_build_hooks(root, prefer_committed_fixtures=False)
         self.assertNotIn("build_bank.py", ran)
         self.assertIn("export_static.py", ran)
 
@@ -248,7 +254,7 @@ class PlaceholderAndPortTests(unittest.TestCase):
             "'<!doctype html><title>Season</title><style>body{color:red}</style>"
             "<body>season book snapshot content here</body>')\n"
         )
-        ran = run_build_hooks(root)
+        ran = run_build_hooks(root, prefer_committed_fixtures=False)
         self.assertIn("render.py", ran)
         self.assertEqual(find_entry(root), "dist/season-book-snapshot.html")
 
@@ -290,3 +296,342 @@ class PlaceholderAndPortTests(unittest.TestCase):
             self.assertTrue(wait_port(port, 3))
         finally:
             server.stop()
+
+
+def _free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _cmds(mock) -> list:
+    found = []
+    for call in mock.call_args_list:
+        if call.args:
+            found.append(call.args[0])
+        else:
+            found.append(call.kwargs.get("args"))
+    return found
+
+
+def _joined(mock) -> str:
+    return "\n".join(str(cmd) for cmd in _cmds(mock))
+
+
+_SCRUBBED_DATA = '{"board": "scrubbed"}\n'
+_SCRUBBED_WEB = (
+    "<!doctype html><title>Committed</title><body>scrubbed board content for the fleet demo</body>"
+)
+_SCRUBBED_DIST = (
+    "<!doctype html><title>Dist</title><body>committed dist snapshot content here</body>"
+)
+_WEB_JSON = '{"board": "web-copy"}\n'
+
+
+def _committed_tree(root: Path, *, server: str | None = None) -> None:
+    (root / "data").mkdir()
+    (root / "data" / "board.json").write_text(_SCRUBBED_DATA)
+    (root / "web").mkdir()
+    (root / "web" / "index.html").write_text(_SCRUBBED_WEB)
+    (root / "web" / "board.json").write_text(_WEB_JSON)
+    (root / "dist").mkdir()
+    (root / "dist" / "index.html").write_text(_SCRUBBED_DIST)
+    (root / "collect.py").write_text(
+        "from pathlib import Path\n"
+        "Path('data/board.json').write_text('{\"from\": \"collect\"}\\n')\n"
+    )
+    (root / "build.py").write_text(
+        "from pathlib import Path\n"
+        "Path('data/board.json').write_text('{\"from\": \"build\"}\\n')\n"
+        "Path('web/index.html').write_text('DIRTY')\n"
+    )
+    (root / "export_snapshot.py").write_text(
+        "from pathlib import Path\n"
+        "Path('dist/index.html').write_text('DIRTY SNAPSHOT')\n"
+    )
+    (root / "node_modules").mkdir()
+    (root / "package.json").write_text(json.dumps({
+        "name": "demo",
+        "scripts": {"build": "node -e \"require('fs').writeFileSync('dist/from-npm.txt','DIRTY')\""},
+    }))
+    if server is not None:
+        (root / "server.py").write_text(server)
+
+
+class CommittedFixturesTests(unittest.TestCase):
+    def test_mode_defaults_on_and_live_values_opt_out(self):
+        from demo_director.prepare import use_committed_fixtures
+
+        self.assertTrue(use_committed_fixtures({}))
+        self.assertTrue(use_committed_fixtures({"DEMO_DIRECTOR_FIXTURES": "1"}))
+        self.assertTrue(use_committed_fixtures({"DEMO_DIRECTOR_FIXTURES": "yes"}))
+        for off in ("0", "false", "no", "off", "live"):
+            self.assertFalse(use_committed_fixtures({"DEMO_DIRECTOR_FIXTURES": off}))
+        self.assertTrue(use_committed_fixtures({"DEMO_DIRECTOR_FIXTURES": "0"}, True))
+        self.assertFalse(use_committed_fixtures({"DEMO_DIRECTOR_FIXTURES": "1"}, False))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEMO_DIRECTOR_FIXTURES", None)
+            self.assertTrue(use_committed_fixtures())
+
+    def test_server_rebuild_detector_matches_live_caches_not_comments(self):
+        from demo_director.prepare import server_rebuilds_on_start
+
+        root = Path(tempfile.mkdtemp())
+        plain = root / "server.py"
+        plain.write_text("import http.server\n# snapshot lives in build.py\n")
+        self.assertFalse(server_rebuilds_on_start(plain))
+        (root / "launch.py").write_text(
+            "import subprocess, sys\nsubprocess.check_call([sys.executable, 'collect.py'])\n"
+        )
+        self.assertTrue(server_rebuilds_on_start(root / "launch.py"))
+        (root / "via_import.py").write_text("import collect\n")
+        self.assertTrue(server_rebuilds_on_start(root / "via_import.py"))
+        (root / "cache.py").write_text("p = '/home/box/agent-data'\n")
+        self.assertTrue(server_rebuilds_on_start(root / "cache.py"))
+        (root / "token.py").write_text("p = '/workspace/tokenmax/newspapers/a.pdf'\n")
+        self.assertTrue(server_rebuilds_on_start(root / "token.py"))
+        (root / "paths.py").write_text("ROOT = '/workspace/tokenmax'\n")
+        (root / "hop.py").write_text("import paths\nimport http.server\n")
+        self.assertTrue(server_rebuilds_on_start(root / "hop.py"))
+
+    def test_default_hooks_skip_collect_build_export(self):
+        root = Path(tempfile.mkdtemp())
+        _committed_tree(root)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEMO_DIRECTOR_FIXTURES", None)
+            ran = run_build_hooks(root)
+        self.assertNotIn("collect.py", ran)
+        self.assertNotIn("build.py", ran)
+        self.assertNotIn("export_snapshot.py", ran)
+        self.assertNotIn("npm:build", ran)
+        self.assertEqual((root / "data" / "board.json").read_text(), _SCRUBBED_DATA)
+        self.assertEqual((root / "web" / "index.html").read_text(), _SCRUBBED_WEB)
+        self.assertEqual((root / "dist" / "index.html").read_text(), _SCRUBBED_DIST)
+        self.assertFalse((root / "dist" / "from-npm.txt").exists())
+
+    def test_env_off_runs_live_collect(self):
+        root = Path(tempfile.mkdtemp())
+        _committed_tree(root)
+        with patch.dict(os.environ, {"DEMO_DIRECTOR_FIXTURES": "0"}):
+            ran = run_build_hooks(root)
+        self.assertIn("collect.py", ran)
+        self.assertIn("build.py", ran)
+        self.assertIn("export_snapshot.py", ran)
+        self.assertEqual((root / "data" / "board.json").read_text(), '{"from": "build"}\n')
+        self.assertEqual((root / "dist" / "index.html").read_text(), "DIRTY SNAPSHOT")
+
+    def test_prepare_and_serve_fixtures_does_not_invoke_rewriters(self):
+        from demo_director.prepare import prepare_and_serve
+
+        root = Path(tempfile.mkdtemp())
+        _committed_tree(
+            root,
+            server=(
+                "import pathlib, subprocess, sys\n"
+                "subprocess.check_call([sys.executable, 'collect.py'])\n"
+                "pathlib.Path('data/board.json').write_text('{\"dirty\": true}\\n')\n"
+                "import http.server, os\n"
+                "PORT=int(os.environ.get('PORT','9'))\n"
+                "class H(http.server.SimpleHTTPRequestHandler):\n"
+                "    def log_message(self, *a): pass\n"
+                "http.server.ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()\n"
+            ),
+        )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEMO_DIRECTOR_FIXTURES", None)
+            with patch("demo_director.prepare.subprocess.run", wraps=subprocess.run) as runs, \
+                 patch("demo_director.prepare.subprocess.Popen", wraps=subprocess.Popen) as spawned:
+                server, built = prepare_and_serve(root, _free_port())
+        try:
+            blob = _joined(runs) + "\n" + _joined(spawned)
+            for name in ("build.py", "collect.py", "export_snapshot.py", "npm"):
+                self.assertNotIn(name, blob)
+            self.assertNotIn("server.py", _joined(spawned))
+            for name in ("collect.py", "build.py", "export_snapshot.py", "npm:build"):
+                self.assertNotIn(name, built)
+            self.assertEqual(server.mode, "http.server")
+            self.assertEqual((root / "data" / "board.json").read_text(), _SCRUBBED_DATA)
+            self.assertEqual((root / "web" / "index.html").read_text(), _SCRUBBED_WEB)
+            self.assertEqual((root / "web" / "board.json").read_text(), _WEB_JSON)
+            self.assertEqual((root / "dist" / "index.html").read_text(), _SCRUBBED_DIST)
+        finally:
+            server.stop()
+
+    def test_prepare_and_serve_live_collect_runs_rewriters(self):
+        from demo_director.prepare import prepare_and_serve
+
+        root = Path(tempfile.mkdtemp())
+        _committed_tree(root)
+        with patch("demo_director.prepare.subprocess.run", wraps=subprocess.run) as runs:
+            server, built = prepare_and_serve(root, _free_port(), prefer_committed_fixtures=False)
+        try:
+            blob = _joined(runs)
+            self.assertIn("collect.py", blob)
+            self.assertIn("build.py", blob)
+            self.assertIn("export_snapshot.py", blob)
+            self.assertIn("collect.py", built)
+            self.assertIn("build.py", built)
+            self.assertIn("export_snapshot.py", built)
+            self.assertEqual((root / "dist" / "index.html").read_text(), "DIRTY SNAPSHOT")
+            self.assertEqual((root / "web" / "index.html").read_text(), "DIRTY")
+        finally:
+            server.stop()
+
+    def test_fixtures_mode_still_starts_a_server_that_does_not_rebuild(self):
+        from demo_director.prepare import prepare_and_serve
+
+        root = Path(tempfile.mkdtemp())
+        (root / "data").mkdir()
+        (root / "data" / "board.json").write_text(_SCRUBBED_DATA)
+        (root / "web").mkdir()
+        (root / "web" / "index.html").write_text(_SCRUBBED_WEB)
+        (root / "build.py").write_text(
+            "from pathlib import Path\nPath('data/board.json').write_text('DIRTY')\n"
+        )
+        (root / "server.py").write_text(
+            "import http.server, os\n"
+            "PORT=int(os.environ.get('PORT','9'))\n"
+            "class H(http.server.SimpleHTTPRequestHandler):\n"
+            "    def __init__(self,*a,**k):\n"
+            "        super().__init__(*a, directory=os.path.join(os.path.dirname(__file__),'web'), **k)\n"
+            "    def log_message(self,*a): pass\n"
+            "http.server.ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()\n"
+        )
+        with patch("demo_director.prepare.subprocess.run", wraps=subprocess.run) as runs:
+            server, built = prepare_and_serve(root, _free_port(), prefer_committed_fixtures=True)
+        try:
+            self.assertEqual(server.mode, "server.py")
+            self.assertNotIn("build.py", _joined(runs))
+            self.assertNotIn("build.py", built)
+            self.assertEqual((root / "data" / "board.json").read_text(), _SCRUBBED_DATA)
+            self.assertEqual((root / "web" / "index.html").read_text(), _SCRUBBED_WEB)
+        finally:
+            server.stop()
+
+    def test_fixtures_mode_skips_node_server_that_reads_agent_data(self):
+        from demo_director.prepare import prepare_and_serve
+
+        root = Path(tempfile.mkdtemp())
+        (root / "public").mkdir()
+        (root / "public" / "index.html").write_text(
+            "<!doctype html><title>Meal</title><body>family meal planner demo</body>"
+        )
+        (root / "data").mkdir()
+        (root / "data" / "board.json").write_text(_SCRUBBED_DATA)
+        (root / "src").mkdir()
+        (root / "src" / "server.js").write_text(
+            "const fs=require('fs');const path=require('path');const http=require('http');\n"
+            "fs.writeFileSync(path.join(__dirname,'../data/board.json'), '{\"dirty\":true}');\n"
+            "const profiles='/home/box/agent-data';\n"
+            "const PORT=Number(process.env.PORT||9);\n"
+            "http.createServer((req,res)=>{res.end('family meal planner demo');})"
+            ".listen(PORT,'127.0.0.1');\n"
+        )
+        (root / "package.json").write_text(json.dumps({
+            "name": "meal",
+            "scripts": {"start": "node src/server.js"},
+        }))
+        server, _built = prepare_and_serve(root, _free_port(), prefer_committed_fixtures=True)
+        try:
+            self.assertEqual(server.mode, "http.server")
+            self.assertEqual((root / "data" / "board.json").read_text(), _SCRUBBED_DATA)
+        finally:
+            server.stop()
+
+    def test_vite_preview_does_not_rebuild_when_fixtures_on(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "node_modules").mkdir()
+        (root / "vite.config.ts").write_text("export default {}\n")
+        (root / "package.json").write_text(json.dumps({"scripts": {"build": "vite build"}}))
+        (root / "dist").mkdir()
+        (root / "dist" / "index.html").write_text(
+            "<!doctype html><title>Vite</title><body>committed vite dist content here</body>"
+        )
+
+        from demo_director.prepare import _stop_proc as real_stop
+
+        spawned: list[subprocess.Popen] = []
+
+        def fake_spawn(cmd, cwd, env):
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                start_new_session=True,
+            )
+            spawned.append(proc)
+            return proc
+
+        def stop_and_reap(proc):
+            real_stop(proc)
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+                proc.wait(timeout=2)
+
+        try:
+            with patch("demo_director.prepare.wait_port", return_value=False), \
+                 patch("demo_director.prepare._spawn", side_effect=fake_spawn), \
+                 patch("demo_director.prepare._stop_proc", side_effect=stop_and_reap), \
+                 patch("demo_director.prepare.run_build_hooks", return_value=[]) as hooks:
+                with self.assertRaises(RuntimeError):
+                    start_server(root, _free_port(), prefer_committed_fixtures=True)
+            self.assertFalse(hooks.called)
+
+            with patch("demo_director.prepare.wait_port", return_value=False), \
+                 patch("demo_director.prepare._spawn", side_effect=fake_spawn), \
+                 patch("demo_director.prepare._stop_proc", side_effect=stop_and_reap), \
+                 patch("demo_director.prepare.run_build_hooks", return_value=["npm:build"]) as hooks:
+                with self.assertRaises(RuntimeError):
+                    start_server(root, _free_port(), prefer_committed_fixtures=False)
+            self.assertTrue(hooks.called)
+        finally:
+            for proc in spawned:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, 9)
+                    except OSError:
+                        proc.kill()
+                    proc.wait(timeout=2)
+
+    def test_fleet_check_cli_defaults_on_and_threads_the_flag(self):
+        from scripts.fleet_check import build_parser, check_repo, fixtures_from_args
+
+        base = ["--set", "s", "--deny", "d", "--org", "o"]
+        args = build_parser().parse_args(base)
+        self.assertIsNone(args.fixtures_cli)
+        self.assertTrue(fixtures_from_args(args, {}))
+        self.assertFalse(fixtures_from_args(args, {"DEMO_DIRECTOR_FIXTURES": "0"}))
+        forced = build_parser().parse_args(base + ["--prefer-committed-fixtures"])
+        self.assertTrue(fixtures_from_args(forced, {"DEMO_DIRECTOR_FIXTURES": "live"}))
+        live = build_parser().parse_args(base + ["--live-collect"])
+        self.assertFalse(fixtures_from_args(live, {"DEMO_DIRECTOR_FIXTURES": "1"}))
+        off = build_parser().parse_args(base + ["--no-prefer-committed-fixtures"])
+        self.assertFalse(fixtures_from_args(off, {}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(base + ["--live-collect", "--prefer-committed-fixtures"])
+
+        work = Path(tempfile.mkdtemp())
+        src = work / "src"
+        repo = src / "sample"
+        repo.mkdir(parents=True)
+        (repo / "index.html").write_text(
+            "<!doctype html><title>T</title><body>hello fleet page content</body>"
+        )
+        with patch("scripts.fleet_check.prepare_and_serve", side_effect=RuntimeError("stop")) as serve:
+            row = check_repo(
+                "sample", "g", "BoydVC", str(work), str(work / "deny.txt"),
+                0.5, 0, str(src),
+            )
+        self.assertEqual(row["bucket"], "other")
+        self.assertTrue(serve.call_args.kwargs["prefer_committed_fixtures"])
+        self.assertEqual(serve.call_args.kwargs["env"]["DEMO_DIRECTOR_FIXTURES"], "1")
+        with patch("scripts.fleet_check.prepare_and_serve", side_effect=RuntimeError("stop")) as serve:
+            check_repo(
+                "sample", "g", "BoydVC", str(work), str(work / "deny.txt"),
+                0.5, 0, str(src), False, False,
+            )
+        self.assertFalse(serve.call_args.kwargs["prefer_committed_fixtures"])
+        self.assertEqual(serve.call_args.kwargs["env"]["DEMO_DIRECTOR_FIXTURES"], "0")
